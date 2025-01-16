@@ -1,0 +1,16 @@
+name: volprim
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - matplotlib
+  - numpy
+  - pandas
+  - pip
+  - pytest
+  - ipywidgets
+  - rich
+  - setuptools
+  - pip:
+      - plyfile
+      - mitsuba

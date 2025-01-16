@@ -1,0 +1,27 @@
+# SublimeText
+*.sublime-project
+*.sublime-workspace
+
+# VS & VSCode
+/.vscode
+/.vs
+
+# Jupyter
+/.ipynb_checkpoints
+*checkpoint.ipynb
+
+# Python
+__pycache__
+*.pyc
+/wheelhouse
+
+# macOS
+\.DS_Store
+
+# Pip
+*.egg-info
+
+*.exr
+*.png
+*.jpg
+*.jpeg
