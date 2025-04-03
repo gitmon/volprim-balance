@@ -6,3 +6,6 @@ rich
 setuptools
 plyfile
 mitsuba
+polyscope
+gpytoolbox
+open3d

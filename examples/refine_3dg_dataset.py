@@ -7,6 +7,8 @@
 This script implements a simple optimization pipeline that refines a given set of
 volumetric primitives (e.g. 3DG) given a set of reference images.
 '''
+import sys
+sys.path.insert(0, '/home/jonathan/Documents/mi3-gs/build/python')
 
 import os, time, argparse, json
 from os.path import join

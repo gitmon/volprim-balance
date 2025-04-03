@@ -15,6 +15,9 @@ Example:
 
     python examples\render_3dg_asset.py --ply datasets\truck\point_cloud\iteration_30000\point_cloud.ply --cameras datasets\truck\cameras.json
 '''
+import os
+import sys
+sys.path.insert(0, '/home/jonathan/Documents/mi3-gs/build/python')
 
 import argparse
 import mitsuba as mi
@@ -29,7 +32,7 @@ parser = argparse.ArgumentParser(description='Render 3DG asset')
 # Required arguments
 parser.add_argument('--ply',     type=str, required=True, help='Path to PLY 3DG file')
 parser.add_argument('--cameras', type=str, required=True, help='Path to json camera file')
-parser.add_argument('--output',  type=str, default='output.exr', help='Path to the output image')
+parser.add_argument('--output',  type=str, default='output', help='Path to the output image')
 
 # Cameras and reference images parameters
 parser.add_argument('--cam_index',  type=int,   default=0,      help='Index of the camera to render')
@@ -75,4 +78,11 @@ with volprim.benchmark.single_run('Rendering'):
 
 # Write image to file on disk
 print(f'Writing rendered image to {args.output}')
-mi.util.write_bitmap(args.output, img)
+mi.util.write_bitmap(os.path.join(args.output, f"output.exr"), img)
+
+# with volprim.benchmark.single_run('Rendering'):
+#     for cam_index in range(len(cam_specs)):
+#         img = mi.render(scene, sensor=cam_index, spp=args.spp)
+#         # Write image to file on disk
+#         # print(f'Writing rendered image to {args.output}')
+#         mi.util.write_bitmap(os.path.join(args.output, f"sensor_{cam_index}.exr"), img)

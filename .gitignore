@@ -25,3 +25,9 @@ __pycache__
 *.png
 *.jpg
 *.jpeg
+
+# Data
+/scenes
+/3dgs_splats
+/3dgs_input
+*.ini

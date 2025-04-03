@@ -7,6 +7,8 @@
 This script implements a simple optimization pipeline that reconstruct an
 absorbing volume using volumetric primitives (no scattering!).
 '''
+import sys
+sys.path.insert(0, '/home/jonathan/Documents/mi3-gs/build/python')
 
 import os, argparse
 from os.path import join
