@@ -11,7 +11,7 @@ sys.path.insert(0, '/home/jonathan/Documents/mi3-gs/build/python')
 
 import os, argparse
 import mitsuba as mi
-mi.set_variant('cuda_ad_rgb', 'llvm_ad_rgb')
+mi.set_variant('cuda_ad_rgb')
 import volprim
 
 parser = argparse.ArgumentParser(description='Render volume')

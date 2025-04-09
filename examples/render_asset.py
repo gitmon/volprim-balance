@@ -22,7 +22,7 @@ parser.add_argument('--output',    type=str,   default='output.exr', help='Path 
 args = parser.parse_args()
 
 import mitsuba as mi
-mi.set_variant(args.variant, 'cuda_ad_rgb', 'llvm_ad_rgb')
+mi.set_variant(args.variant, 'cuda_ad_rgb')
 import volprim
 
 # Assemble the scene dictionary from the Python asset
