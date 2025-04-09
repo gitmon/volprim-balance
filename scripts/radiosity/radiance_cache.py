@@ -189,6 +189,15 @@ class SamplingMethod(Enum):
     Cosine = 2
     BSDF = 3
 
+def sph_to_dir(theta, phi):
+        st, ct = dr.sincos(theta)
+        sp, cp = dr.sincos(phi)
+        wi = mi.Vector3f(
+            st * cp,
+            st * sp,
+            ct)
+        return wi
+
 class RadianceCache:
     def __init__(self, mi_scene: mi.Scene, pcd_path: str):
         '''
@@ -211,7 +220,7 @@ class RadianceCache:
             }
         }
 
-        # self.mi_scene = mi_scene
+        self.mi_scene = mi_scene
         self.gs_scene: mi.Scene = mi.load_dict(scene_dict)
         self.integrator: mi.ad.common.ADIntegrator = self.gs_scene.integrator()
         
@@ -235,7 +244,6 @@ class RadianceCache:
             active = dr.full(Bool, True, dr.width(rays))
         num_rays = dr.width(rays)
         sampler_rt.seed(rng_state, num_rays); rng_state += 0x00FF_FFFF
-        # L = self.integrator.sample(self.gs_scene, sampler_rt, rays, active = active)[0]
         L, active = self.integrator.sample(dr.ADMode.Primal, self.gs_scene, sampler_rt, rays, δL = None, state_in = 0.0, active = active)[:2]
         L = dr.select(active, L, dr.zeros(mi.Color3f))
         return L, rng_state
@@ -260,20 +268,24 @@ class RadianceCache:
 
     
     def _spawn_offset_ray(self, si: mi.SurfaceInteraction3f, d: mi.Vector3f):
-        # Fixed epsilon method
-        ray = mi.Ray3f(si.p, d) # si.spawn_ray(d)
-        ray.o += self.surface_eps * ray.d
-        return ray
-    
-        # # TODO: `intersect_preliminary` method
-        # ray = si.spawn_ray(d)
-        # pi = self.mi_scene.ray_intersect_preliminary(ray)
-        # surface_eps = dr.select(
-        #     pi.is_valid(), 
-        #     dr.maximum(0.5 * pi.t, self.surface_eps), 
-        #     self.surface_eps)
-        # ray.o += surface_eps * ray.d
+        # # Fixed epsilon method
+        # ray = mi.Ray3f(si.p, d) # si.spawn_ray(d)
+        # ray.o += self.surface_eps * ray.d
         # return ray
+    
+        ray = mi.Ray3f(si.p, d)
+        # TODO: `intersect_preliminary` method
+        dr.eval(ray)
+        # find offset using gt_geometry raytrace
+        first_hit = self.mi_scene.ray_intersect_preliminary(ray)
+        max_extent = dr.max(self.gs_scene.bbox().extents())
+        offset = dr.select(
+            first_hit.is_valid(), 
+            0.5 * first_hit.t,
+            0.1 * max_extent)
+        dr.eval(ray, offset)
+        ray.o += offset * ray.d
+        return ray
 
         # # TODO: `intersect_preliminary` method
         # max_extent = dr.max(self.merged_scene.bbox().extents())
@@ -310,12 +322,13 @@ class RadianceCache:
         Lo_rays = self._spawn_offset_ray(si, wo_world)
         Lo_rays.d = -Lo_rays.d
 
-        active = True   # TODO: disabled
+        active = True   
         # # The ray that's spawned from `si` should intersect `si.shape` again. Due to RayEpsilons and 
         # # spawn offsets, there exist edge cases where this does not occur: for example, when `si` lies
         # # on the boundary edge of a rectangular plane. If this occurs, we should omit this `si` from 
         # # the loss calculation.
         # active = (self.mi_scene.ray_intersect_preliminary(Lo_rays).shape == si.shape)
+        # ^ TODO: disabled
 
         # Pathtrace along `-wo` to get the radiance when looking at `A`. For each `Lo_ray`,
         # compute `SPP_LO` different pathtraced samples and average them to get the outgoing 
@@ -326,22 +339,40 @@ class RadianceCache:
     def _render_hemisphere(self, si_scalar: mi.SurfaceInteraction3f, sampler_rt: mi.Sampler, N: int, offset: float = 0.0):
         theta = dr.linspace(Float, 0.0, 0.5 * dr.pi, N)
         phi = dr.linspace(Float, 0.0, dr.two_pi, 4 * N)
-        tt, pp = dr.meshgrid(theta, phi)
+        pp, tt = dr.meshgrid(phi, theta)
 
-        # wi = mi.sph_to_dir(tt, pp)
-        st, ct = dr.sincos(tt)
-        sp, cp = dr.sincos(pp)
-        wi = mi.Vector3f(
-            st * cp,
-            st * sp,
-            ct)
-
+        wi = sph_to_dir(tt, pp)
         wi_world = si_scalar.to_world(wi)
 
         rays = si_scalar.spawn_ray(wi_world)
         rays.o += offset * rays.d
         L = self._pathtrace(rays, sampler_rt, rng_state=0)[0]
-        image_out = mi.TensorXf(dr.ravel(L), shape=(4*N, N, 3))
+        image_out = mi.TensorXf(dr.ravel(L), shape=(N, 4*N, 3))
+        return image_out, rays
+
+    def _render_hemisphere_auto_offset(self, si_scalar: mi.SurfaceInteraction3f, sampler_rt: mi.Sampler, N: int):
+        theta = dr.linspace(Float, 0.0, 0.5 * dr.pi, N)
+        phi = dr.linspace(Float, 0.0, dr.two_pi, 4 * N)
+        pp, tt = dr.meshgrid(phi, theta)
+
+        wi = sph_to_dir(tt, pp)
+        wi_world = si_scalar.to_world(wi)
+
+        rays = si_scalar.spawn_ray(wi_world)
+
+        dr.eval(rays)
+        # find offset using gt_geometry raytrace
+        first_hit = self.mi_scene.ray_intersect_preliminary(rays)
+        max_extent = dr.max(self.gs_scene.bbox().extents())
+        offset = dr.select(
+            first_hit.is_valid(), 
+            0.5 * first_hit.t,
+            0.1 * max_extent)
+        dr.eval(rays, offset)
+
+        rays.o += offset * rays.d
+        L = self._pathtrace(rays, sampler_rt, rng_state=0)[0]
+        image_out = mi.TensorXf(dr.ravel(L), shape=(N, 4*N, 3))
         return image_out, rays
 
 
@@ -812,3 +843,29 @@ def _compute_loss_mis(
 #             si_wide.wi = dr.gather(mi.Vector3f, si.wi, dr.repeat(dr.arange(UInt, num_points), num_wi), dr.ReduceMode.Local)
 
 #     return loss
+
+
+
+
+def render_hemisphere_rt(scene: mi.Scene, si_scalar: mi.SurfaceInteraction3f, sampler_rt: mi.Sampler, N: int, spp: int, rng_state: int = 0):
+    theta = dr.linspace(Float, 0.0, 0.5 * dr.pi, N)
+    phi = dr.linspace(Float, 0.0, dr.two_pi, 4 * N)
+    pp, tt = dr.meshgrid(phi, theta)
+    st, ct = dr.sincos(tt)
+    sp, cp = dr.sincos(pp)
+    wi = mi.Vector3f(
+        st * cp,
+        st * sp,
+        ct)
+
+    wi_world = si_scalar.to_world(wi)
+    rays = si_scalar.spawn_ray(wi_world)
+    rays.o += 1e-3 * rays.d
+
+    num_rays = dr.width(rays)
+    rays_flat = dr.gather(mi.Ray3f, rays, dr.repeat(dr.arange(UInt, num_rays), spp))
+    sampler_rt.seed(rng_state, num_rays * spp)
+    colors = scene.integrator().sample(scene, sampler_rt, rays_flat)[0]
+    L = dr.block_reduce(dr.ReduceOp.Add, colors, block_size = spp) / spp
+    image_out = mi.TensorXf(dr.ravel(L), shape=(N, 4*N, 3))
+    return image_out, rays

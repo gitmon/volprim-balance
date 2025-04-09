@@ -209,16 +209,17 @@ def render_attributes_gt(scene: mi.Scene, img_res = None, write_img = True, file
     bsdf = mesh.bsdf()
     mask = si.is_valid()
 
+    albedo_key = "base_color" if dr.any(bsdf.has_attribute("base_color")) else "reflectance"
     # Handle the base color first
     image_rgb = dr.select(mask, 
-                    bsdf.eval_attribute_3("base_color", si),
+                    bsdf.eval_diffuse_reflectance(si),
                     mi.Color3f(0.0))
     images = [image_rgb]
     channel_counts = [3]
     total_channels = 3
 
     # Handle the scalar attributes
-    keys = ['base_color', 'roughness', 'metallic', 'anisotropic', 'spec_tint']
+    keys = [albedo_key, 'roughness', 'metallic', 'anisotropic', 'spec_tint']
     for key in keys[1:]:
         image = dr.select(si.is_valid(), 
                         bsdf.eval_attribute_1(key, si),
