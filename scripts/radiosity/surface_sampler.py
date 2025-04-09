@@ -13,19 +13,25 @@ def is_delta_emitter(emitter: mi.Emitter):
            (emitter.m_flags & mi.EmitterFlags.DeltaDirection)
 
 class SceneSurfaceSampler:
-    def __init__(self, scene: mi.Scene, method="equiarea"):
+    def __init__(self, scene: mi.Scene, phantom_origin: mi.ScalarPoint3f = mi.ScalarPoint3f(0.0, 0.0, 0.0), method: str = "equiarea"):
         shape_ptrs = scene.shapes_dr()
         if method == "equiarea":
             # probability is proportional to mesh area
-            self.distribution = mi.DiscreteDistribution(shape_ptrs.surface_area())
+            areas = dr.select(
+                shape_ptrs.shape_type() != +mi.ShapeType.Ellipsoids, 
+                shape_ptrs.surface_area(),
+                0.0)
+            self.distribution = mi.DiscreteDistribution(areas)
         elif method == "mesh-res":
             # probability is inversely proportional to avg_triangle_area
-            prims_per_shape = dr.select(shape_ptrs.is_mesh(), mi.MeshPtr(shape_ptrs).face_count(), 1)
+            prims_per_shape = dr.select(shape_ptrs.shape_type() == +mi.ShapeType.Mesh, mi.MeshPtr(shape_ptrs).face_count(), 1)
             mean_prim_area = shape_ptrs.surface_area() / prims_per_shape
             self.distribution = mi.DiscreteDistribution(dr.rcp(mean_prim_area))
         self.shape_ptrs = shape_ptrs
         self.has_delta_emitters = dr.any((scene.emitters_dr().flags() & UInt(mi.EmitterFlags.Delta)) > 0)
         self.delta_emitters = [emitter for emitter in scene.emitters() if is_delta_emitter(emitter)]
+
+        self.phantom_origin = phantom_origin
 
     def sample(self, num_points: int, sampler_rt: mi.Sampler, rng_state: int = 0) -> mi.SurfaceInteraction3f:
         '''
@@ -49,6 +55,9 @@ class SceneSurfaceSampler:
         uv = sampler_rt.next_2d()
         wo_local = mi.warp.square_to_cosine_hemisphere(uv)
         si.wi = wo_local
+
+        # Translate samples back to the real origin
+        si.p -= self.phantom_origin
 
         # Compute the Li contribution from delta emitter sources
         if len(self.delta_emitters) > 0:

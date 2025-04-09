@@ -142,7 +142,7 @@ def render_base_color(scene: mi.Scene, img_res = None, write_img = True, filenam
 
     return image_out
 
-def render_attributes(scene: mi.Scene, img_res = None, write_img = True, filename: str = "optimized"):
+def render_attributes(scene: mi.Scene, t: mi.ScalarPoint3f, img_res = None, write_img = True, filename: str = "optimized"):
     '''
     Render all the vertex BSDF attributes to an OpenEXR image.
     '''
@@ -152,6 +152,7 @@ def render_attributes(scene: mi.Scene, img_res = None, write_img = True, filenam
     us, vs = dr.meshgrid(dr.linspace(Float, 0.0, 1.0, img_res[0]), dr.linspace(Float, 0.0, 1.0, img_res[1]))
     sensor = scene.sensors()[0]
     rays, _ = sensor.sample_ray(0.0, 0.0, mi.Point2f(us, vs), dr.zeros(mi.Point2f))
+    rays.o += t
     si = scene.ray_intersect(rays)
     mesh = si.shape
     mask = si.is_valid()
