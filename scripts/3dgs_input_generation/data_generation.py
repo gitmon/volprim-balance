@@ -191,7 +191,7 @@ class DataSplit(Enum):
     Train = 0
     Test = 1
 
-def render_views(scene: mi.Scene, output_path: str, camera_params: CameraParameters, camera_poses: CameraPose, split: DataSplit = DataSplit.Train, denoise = True) -> None:
+def render_views(scene: mi.Scene, output_path: str, camera_params: CameraParameters, camera_poses: CameraPose, split: DataSplit = DataSplit.Train, denoise: bool = True) -> None:
     """
     Render the views from the set of input camera poses and write them to disk.
     """
@@ -346,3 +346,121 @@ class DataGenerator:
             ps.register_camera_view(f"cam{camera_id}", params)
 
         ps.show()
+
+
+
+
+def render_views_HDR(scene: mi.Scene, output_path: str, camera_params: CameraParameters, camera_poses: CameraPose, denoise: bool = True) -> None:
+    """
+    Render the views from the set of input camera poses and write them to disk.
+    """
+    # split_name = "train" if split == DataSplit.Train else "test"
+
+    if denoise:
+        integrator = mi.load_dict({
+            'type': 'aov',
+            'aovs': 'albedo:albedo,normals:sh_normal',
+            'integrator': {
+                'type': 'path',
+                'max_depth': 17,
+                }
+            })
+        img_size = mi.ScalarVector2u(camera_params.width, camera_params.height)
+        denoiser = mi.OptixDenoiser(input_size=img_size, albedo=True, normals=True, temporal=False)
+
+    for camera_id, sensor_dict in enumerate(tqdm(create_camera(camera_params, camera_poses))):
+        sensor = mi.load_dict(sensor_dict)
+        if denoise:
+            mi.render(scene, sensor=sensor, integrator=integrator)
+            noisy = sensor.film().bitmap()
+            to_sensor = sensor.world_transform().inverse()
+            denoised = denoiser(noisy, albedo_ch="albedo", normals_ch="normals", to_sensor=to_sensor)
+            image = denoised
+        else:
+            image = mi.render(scene, sensor=sensor)
+
+        # write HDR image
+        fp = os.path.join(output_path, "exr", f"{camera_id}.exr")
+        mi.util.write_bitmap(fp, image, write_async=True)
+
+        # write LDR images
+        exposures = [0.2, 0.4, 0.6, 0.8, 1.0]
+        for exp_id, scale_factor in enumerate(exposures):
+            fp = os.path.join(output_path, "images", f"{camera_id}_{exp_id}.png")
+            _image = mi.Bitmap(scale_factor * mi.TensorXf(image))
+            mi.util.write_bitmap(fp, _image, write_async=True)
+
+
+def write_poses_to_json_HDR(output_path: str, camera_params: CameraParameters, poses: CameraPose) -> None:
+    """
+    Write the input camera poses to disk as a .json file.
+    """
+    # Specify intrinsic parameters
+    json_data = {
+        "camera_angle_x": dr.deg2rad(camera_params.fov),
+        'w': camera_params.width,
+        'h': camera_params.height,
+        'cx': camera_params.width / 2,
+        'cy': camera_params.height / 2,
+    }
+
+    # Specify camera world poses
+    frames = []
+    for camera_id, (origin, target, up) in enumerate(zip(poses.origin, poses.target, poses.up)):
+        frame = {
+            "file_path": f"{camera_id}",
+        }
+        to_world_matrix = mi.ScalarTransform4f().look_at(tuple(origin), tuple(target), tuple(up))
+        to_world_matrix = to_world_matrix.matrix.numpy()
+        # Appropriate coordinate system transform can be found in the Instant-NGP repo:
+        # https://github.com/NVlabs/instant-ngp/blob/5595c47639ab495bad66f4d661ea2720d30befa6/include/neural-graphics-primitives/nerf_loader.h#L108
+        to_world_matrix = to_world_matrix.astype(np.double) @ np.diag([-1, 1, -1, 1])
+        
+        frame["transform_matrix"] = [
+            list(to_world_matrix[0]),
+            list(to_world_matrix[1]),
+            list(to_world_matrix[2]),
+            list(to_world_matrix[3]),
+        ]
+        frames.append(frame)
+
+    json_data["frames"] = frames
+    filepath = os.path.join(output_path, f"transforms_train.json")
+    with open(filepath, 'w') as f:
+        json.dump(json_data, f, ensure_ascii=False, indent=4)
+
+
+class DataGeneratorHDR(DataGenerator):
+    def __init__(self, scene: mi.Scene, dataset_name: str, camera_params: CameraParameters, camera_poses: CameraPose, pointcloud_size: int = 1 << 20, use_denoiser: bool = False):
+        super().__init__(scene, dataset_name, camera_params, camera_poses, pointcloud_size, use_denoiser)
+
+    def run(self):
+        try:
+            os.makedirs(os.path.join(self.output_path, "exr"))
+        except FileExistsError:
+            # directory already exists
+            pass
+
+        try:
+            os.makedirs(os.path.join(self.output_path, "images"))
+        except FileExistsError:
+            # directory already exists
+            pass
+
+        try:
+            os.makedirs(os.path.join(self.output_path, "sparse", "0"))
+        except FileExistsError:
+            # directory already exists
+            pass
+
+        poses_train = self.camera_poses
+
+        # Generate train data
+        print("Starting render job for training data ...")
+        render_views_HDR(self.scene, self.output_path, self.camera_params, poses_train, denoise=self.use_denoiser)
+        write_poses_to_json_HDR(     self.output_path, self.camera_params, poses_train)
+        print("Training data render complete.")
+
+        # Generate point cloud
+        pc_path = os.path.join(self.output_path, "sparse", "0")
+        write_point_cloud(self.scene, pc_path, self.pointcloud_size, filename="points3D.ply")
