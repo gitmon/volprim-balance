@@ -380,15 +380,15 @@ def render_views_HDR(scene: mi.Scene, output_path: str, camera_params: CameraPar
             image = mi.render(scene, sensor=sensor)
 
         # write HDR image
-        fp = os.path.join(output_path, "exr", f"{camera_id}.exr")
+        fp = os.path.join(output_path, "train", f"{camera_id}.exr")
         mi.util.write_bitmap(fp, image, write_async=True)
 
-        # write LDR images
-        exposures = [0.2, 0.4, 0.6, 0.8, 1.0]
-        for exp_id, scale_factor in enumerate(exposures):
-            fp = os.path.join(output_path, "images", f"{camera_id}_{exp_id}.png")
-            _image = mi.Bitmap(scale_factor * mi.TensorXf(image))
-            mi.util.write_bitmap(fp, _image, write_async=True)
+        # # write LDR images
+        # exposures = [0.2, 0.4, 0.6, 0.8, 1.0]
+        # for exp_id, scale_factor in enumerate(exposures):
+        #     fp = os.path.join(output_path, "images", f"{camera_id}_{exp_id}.png")
+        #     _image = mi.Bitmap(scale_factor * mi.TensorXf(image))
+        #     mi.util.write_bitmap(fp, _image, write_async=True)
 
 
 def write_poses_to_json_HDR(output_path: str, camera_params: CameraParameters, poses: CameraPose) -> None:
@@ -436,7 +436,7 @@ class DataGeneratorHDR(DataGenerator):
 
     def run(self):
         try:
-            os.makedirs(os.path.join(self.output_path, "exr"))
+            os.makedirs(os.path.join(self.output_path, "train"))
         except FileExistsError:
             # directory already exists
             pass

@@ -26,79 +26,102 @@ def compute_face_areas(mesh: mi.Mesh, face_idxs: mi.Point3u):
         return 0.5 * dr.norm(dr.cross(e0, e1))
 
 
-# TODO: update for GS scene.
 class EnergyPMF:
     def __init__(self, scene: mi.Scene):
-        self.build_energy_pmf(scene)
-        self.meshes = scene.shapes_dr()
+        ellipsoids_found = False
+        for shape in scene.shapes():
+            if shape.shape_type() == +mi.ShapeType.Ellipsoids:
+                ellipsoids = shape
+                ellipsoids_found = True
+                break
+
+        if not(ellipsoids_found):
+            raise Exception("Scene does not contain an EllipsoidMesh!")
+            
+        self.parse_ellipsoids(scene, ellipsoids)
+        self.build_energy_pmf(ellipsoids)
+
+    def parse_ellipsoids(self, scene: mi.Scene, ellipsoids: mi.Mesh):
+        # `primitive_count()` returns the number of triangles used in the mesh representation of *all* the gaussians
+        tri_count = ellipsoids.primitive_count()
+
+        pose_key = "primitives.data"
+        sh_key = "primitives.sh_coeffs"
+        params_tmp = mi.traverse(scene)
+
+        # 10 floats define the pose: translation (3) + rotation (4) + scale (3)
+        pose_count = 10
+        SH_DEGREE = 3
+        sh_count = (3 * (SH_DEGREE + 1) ** 2)
+        assert dr.width(params_tmp[sh_key]) // sh_count == dr.width(params_tmp[pose_key]) // pose_count, "SH and/or pose counts are invalid!"
+
+        ellipsoid_count = dr.width(params_tmp[pose_key]) // pose_count
+        assert ellipsoid_count * pose_count == dr.width(params_tmp[pose_key]), "Calculation of `ellipsoid_count` is invalid!"
+
+        tris_per_splat = tri_count // ellipsoid_count
+        assert tris_per_splat * ellipsoid_count == tri_count, "Calculation of `ellipsoid_count` and/or `tri_count` is invalid!"
+
+        self.ellipsoids: mi.Mesh = ellipsoids
+        self.ellipsoid_count: int = ellipsoid_count
+        self.tri_count: int = tri_count
+        self.tris_per_splat: int = tris_per_splat
         # keep scene reference to perform ray intersection tests
         self.scene = scene
+        self.scene: mi.Scene = scene
 
-    def build_energy_pmf(self, scene: mi.Scene) -> mi.DiscreteDistribution:
-        # Populate the meshes with SH coefficient data
-        print("Fitting spherical harmonics to scene...")
+    def tri_index_to_ellipsoid_index(self, tri_idx: UInt):
+        # Needed to index into attributes via `eval_attribute_{1/3/x}()`
+        # these methods take a SurfaceInteraction3f as input; we fetch a chosen 
+        # *ellipsoid*'s data using the `si.prim_index` field
+        return tri_idx // self.tris_per_splat
 
-        sh_order = 3
-        fit_sh_on_scene(scene, sh_order)
+    def build_energy_pmf(self, ellipsoids: mi.Mesh) -> mi.DiscreteDistribution:
+        # Build an energy PMF over the GS triangles. Each EllipsoidMesh triangle
+        # is weighted by its radiant intensity, which we compute using the L2 norm
+        # of the ellipsoid's SH coefficients.
 
-        print("Fitting complete.")
+        # First, construct a face-centered `si` on each mesh face to query the 
+        # SH coeffs
+        tri_count = ellipsoids.primitive_count()
+        si = dr.zeros(mi.SurfaceInteraction3f, tri_count)
+        F = dr.unravel(mi.Point3u, ellipsoids.faces_buffer())
+        v1 = ellipsoids.vertex_position(F.x)
+        v2 = ellipsoids.vertex_position(F.y)
+        v3 = ellipsoids.vertex_position(F.z)
+        vc = (v1 + v2 + v3) / 3.0
+        nc = dr.cross(v2 - v1, v3 - v1)
+        tri_areas = dr.norm(nc)
+        nc /= tri_areas
+        ell_index = self.tri_index_to_ellipsoid_index(dr.arange(UInt, 0, tri_count))
+        si.p = vc
+        si.n = nc
+        si.prim_index = ell_index
 
-        # Compute triangle indexing data
-        meshes = scene.shapes_dr()
-        mesh_active = meshes.is_mesh()
-        face_counts = dr.cuda.ad.UInt(dr.select(mesh_active, mi.MeshPtr(meshes).face_count(), 0))
-        mesh_start_indices = dr.prefix_reduce(dr.ReduceOp.Add, face_counts, exclusive=True)
-        mesh_end_indices   = dr.prefix_reduce(dr.ReduceOp.Add, face_counts, exclusive=False)
+        # Lookup SH coeffs
+        sh_coeffs = ellipsoids.eval_attribute_x("sh_coeffs", si)
+        # GS adds a DC offset of +0.5 to the emitted radiance; this can be absorbed 
+        # into the zeroth SH coeff
+        sh_coeffs[0] += 0.5 * dr.sqrt(dr.four_pi)   
+        sh_coeffs[1] += 0.5 * dr.sqrt(dr.four_pi)
+        sh_coeffs[2] += 0.5 * dr.sqrt(dr.four_pi)
+        sh_norm = dr.norm(sh_coeffs)
+        opacities = ellipsoids.eval_attribute_1("opacities", si)
 
-        # Compute per-triangle energies
-        E_scene = dr.zeros(Float, mesh_end_indices[-1])
-        for mesh_idx, mesh in enumerate(meshes):
-            # Compute the outgoing energy from each mesh vertex as the sum of the squared SH coefficients
-            vertex_energies = dr.zeros(Float, mesh.vertex_count())
-            for sh_idx in range(get_sh_count(sh_order)):
-                vertex_coeffs = dr.unravel(mi.Color3f, mesh.attribute_buffer(f"vertex_Lo_coeffs_{sh_idx}"))
-                vertex_energies += dr.squared_norm(vertex_coeffs)
-
-            E_faces = dr.zeros(Float, mesh.face_count())
-            face_idxs = dr.unravel(mi.Point3u, mesh.faces_buffer())
-            face_area = compute_face_areas(mesh, face_idxs)
-            dtype = type(vertex_energies)
-            # E_vi has units of (irradiance) ** 2 -- it is the integral of the *squared* radiance Lo over 
-            # the hemisphere. 
-            E_v1 = dr.gather(dtype, vertex_energies, face_idxs.x)
-            E_v2 = dr.gather(dtype, vertex_energies, face_idxs.y)
-            E_v3 = dr.gather(dtype, vertex_energies, face_idxs.z)
-            # To compute the emitted power of the triangle, take the sqrt() of E_vi and scale by the triangle area.
-            E_faces = face_area * dr.rcp(3.0) * (dr.sqrt(E_v1) + dr.sqrt(E_v2) + dr.sqrt(E_v3))
-
-            # Store the mesh faces' energy values in the scene-level energy-per-vertex array
-            start_idx = mesh_start_indices[mesh_idx]
-            end_idx = mesh_end_indices[mesh_idx]
-            dr.scatter_add(E_scene, E_faces, dr.arange(UInt, start_idx, end_idx))
+        # Compute the per-face energy
+        E_faces = sh_norm * opacities * tri_areas
 
         # Construct the probability distribution
-        pmf = mi.DiscreteDistribution(E_scene)
+        pmf = mi.DiscreteDistribution(E_faces)
         self.pmf = pmf
-        self.mesh_start_idxs = mesh_start_indices 
-        self.mesh_end_idxs = mesh_end_indices
-
     
     def sample(self, si: mi.SurfaceInteraction3f, sample1: Float, sample2: mi.Point2f) -> tuple[mi.Vector3f, Float, Float]:
         # Sample a triangle in the emissive scene
         # NOTE: sample_reuse_pmf() appears to be nondeterministic wrt reused_sample!!!
-        global_face_idx, pdf = self.pmf.sample_pmf(sample1)
-
-        # Find the mesh and prim index corresponding to this triangle
-        dtype = type(self.mesh_end_idxs)
-        mesh_count = len(self.mesh_end_idxs)
-        mesh_idxs = dr.binary_search(0, mesh_count, lambda index: dr.gather(dtype, self.mesh_end_idxs, index) <= global_face_idx)
-        idx_offset = dr.gather(dtype, self.mesh_start_idxs, mesh_idxs)
-        local_face_idx = global_face_idx - idx_offset
+        tri_idx, pdf = self.pmf.sample_pmf(sample1)
 
         # Sample a point on the triangle
-        mesh = dr.gather(mi.MeshPtr, self.meshes, mesh_idxs)
-        fi = mesh.face_indices(local_face_idx)
-
+        mesh = self.ellipsoids
+        fi = mesh.face_indices(tri_idx)
         p0 = mesh.vertex_position(fi.x)
         p1 = mesh.vertex_position(fi.y)
         p2 = mesh.vertex_position(fi.z)
@@ -109,12 +132,13 @@ class EnergyPMF:
         # Compute surface data at sample
         pdf_area = pdf / compute_face_areas(mesh, fi)
         sample_pos = dr.fma(e0, b.x, dr.fma(e1, b.y, p0))
-        sample_n = dr.select(
-            mesh.has_vertex_normals(), 
-            dr.fma(mesh.vertex_normal(fi.x), (1.0 - b.x - b.y),
-                    dr.fma(mesh.vertex_normal(fi.y), b.x,
-                           mesh.vertex_normal(fi.z) * b.y)),
-            dr.cross(e0, e1))
+        # if mesh.has_vertex_normals():
+        #     sample_n = dr.fma(mesh.vertex_normal(fi.x), (1.0 - b.x - b.y),
+        #                dr.fma(mesh.vertex_normal(fi.y), b.x,
+        #                       mesh.vertex_normal(fi.z) * b.y))
+        # else:
+        #     sample_n = dr.cross(e0, e1)
+        sample_n = dr.cross(e0, e1)
         sample_n = dr.normalize(sample_n)
 
         # Handle geometry term and convert pdf to solid angle measure
@@ -126,8 +150,11 @@ class EnergyPMF:
         pdf_angle = dr.select(G > 0.0, pdf_area * dr.rcp(G), 0.0)
 
         # Handle visibility
-        vis_ray = si.spawn_ray_to(sample_pos)
-        occluded = self.scene.ray_test(vis_ray)
+        # # TODO: RE-ENABLE occluded term with pace-skipping
+        # vis_ray = si.spawn_ray_to(sample_pos)
+        # occluded = self.scene.ray_test(vis_ray)
+        # print(dr.compress(~occluded))
+        occluded = dr.zeros(Bool, dr.width(si))
 
         # MC weight: vis / l_pdf_angle
         weight = dr.select(~occluded & (pdf_angle > 0.0), dr.rcp(pdf_angle), 0.0)
@@ -140,27 +167,18 @@ class EnergyPMF:
         ray = si.spawn_ray(d_world)
         pi = self.scene.ray_intersect_preliminary(ray)
         active = pi.is_valid()
-        local_face_idx = pi.prim_index
+        tri_idx = pi.prim_index
 
-        # Find the index of the hit triangle in the energy PMF
-        mesh_idx = dr.zeros(dr.cuda.ad.UInt, dr.width(wi_local))
-        for i, shape in enumerate(self.meshes):
-            mesh_idx[pi.shape == shape] = i
-        idx_offsets = dr.gather(type(self.mesh_start_idxs), self.mesh_start_idxs, mesh_idx)
-        global_face_idx = dr.select(active, local_face_idx + idx_offsets, 0)
-        
         # Evaluate the hit probability
-        meshes = dr.gather(mi.MeshPtr, self.meshes, mesh_idx)
-        fi = meshes.face_indices(local_face_idx)
+        mesh = self.ellipsoids
+        fi = mesh.face_indices(tri_idx)
         pdf = dr.select(active, 
-                        self.pmf.eval_pmf_normalized(global_face_idx) / compute_face_areas(meshes, fi),
+                        self.pmf.eval_pmf_normalized(tri_idx) / compute_face_areas(mesh, fi),
                         Float(0.0))
         
         # Compute geometry term for this hit point
         dist = pi.t
         si_triangle = pi.compute_surface_interaction(ray, active=active)
-        # TODO: sh_frame.n or si.n?
-        # cos_theta_o = dr.abs(dr.dot(si_triangle.sh_frame.n, -d_world))
         cos_theta_o = dr.abs(dr.dot(si_triangle.n, -d_world))   
         G = dr.select(active & (dist > 0.0), cos_theta_o * dr.rcp(dist * dist), 0.0)
 
@@ -181,7 +199,6 @@ class EnergyPMF:
 
 
 from enum import Enum
-import json
 
 class SamplingMethod(Enum):
     Emitter = 0
@@ -217,16 +234,16 @@ class RadianceCache:
                 'max_depth': 128,
                 'rr_depth':  128,
                 'kernel_type': 'gaussian',
+                # Assume that the GS scene outputs *linear* RGB radiance data
+                'srgb_primitives': False,
             }
         }
 
         self.mi_scene = mi_scene
         self.gs_scene: mi.Scene = mi.load_dict(scene_dict)
         self.integrator: mi.ad.common.ADIntegrator = self.gs_scene.integrator()
-        
-        # TODO
-        self.surface_eps = 3e-1
-        # self.energy_pmf = EnergyPMF(self.gs_scene)
+        self.energy_pmf = EnergyPMF(self.gs_scene)
+        self.max_extent = dr.max(self.gs_scene.bbox().extents())
 
         # TODO
         # merged_dict = scene_dict
@@ -248,55 +265,19 @@ class RadianceCache:
         L = dr.select(active, L, dr.zeros(mi.Color3f))
         return L, rng_state
     
-    def _ray_intersect_geometry(self, ray_: mi.Ray3f):
-        with dr.suspend_grad():
-            active = dr.ones(mi.Bool, dr.width(ray_))
-            escaped = dr.zeros(mi.Bool, dr.width(ray_))
-            t = dr.zeros(Float, dr.width(ray_))
-            ray = mi.Ray3f(ray_)
-            # Trace the ray, ignoring ellipsoids, until it either hits real geometry
-            # or leaves the scene.
-            while dr.any(active):
-                    pi: mi.PreliminaryIntersection3f = self.merged_scene.ray_intersect_preliminary(ray, active)
-                    t[active] += pi.t
-                    escaped |= ~pi.is_valid()
-                    active &= ~escaped & (pi.shape.shape_type() & +mi.ShapeType.Ellipsoids)
-                    ray.o[active] += ray.d * (pi.t + 1e-4)
-
-            hit_geo = ~escaped
-            return t, hit_geo, pi.compute_surface_interaction(ray)
-
-    
     def _spawn_offset_ray(self, si: mi.SurfaceInteraction3f, d: mi.Vector3f):
-        # # Fixed epsilon method
-        # ray = mi.Ray3f(si.p, d) # si.spawn_ray(d)
-        # ray.o += self.surface_eps * ray.d
-        # return ray
-    
         ray = mi.Ray3f(si.p, d)
         # TODO: `intersect_preliminary` method
         dr.eval(ray)
         # find offset using gt_geometry raytrace
         first_hit = self.mi_scene.ray_intersect_preliminary(ray)
-        max_extent = dr.max(self.gs_scene.bbox().extents())
         offset = dr.select(
             first_hit.is_valid(), 
             0.5 * first_hit.t,
-            0.1 * max_extent)
+            0.1 * self.max_extent)
         dr.eval(ray, offset)
         ray.o += offset * ray.d
         return ray
-
-        # # TODO: `intersect_preliminary` method
-        # max_extent = dr.max(self.merged_scene.bbox().extents())
-        # ray = si.spawn_ray(d)
-        # t, hit_geo = self._ray_intersect_geometry(ray)
-        # surface_offset = dr.select(
-        #     hit_geo,
-        #     dr.maximum(0.5 * t, self.surface_eps),
-        #     0.5 * max_extent)
-        # ray.o += surface_offset * ray.d
-        # return ray
 
     def eval_Le(self, si: mi.SurfaceInteraction3f) -> mi.Color3f:
         # mesh = si.shape
@@ -318,7 +299,6 @@ class RadianceCache:
         # Note that `wo` is stored in the `si.wi` field (unintuitive, but needed for BSDF.eval() later)
         wo_local = si.wi
         wo_world = si.to_world(wo_local)
-        # Lo_rays = si.spawn_ray(wo_world)
         Lo_rays = self._spawn_offset_ray(si, wo_world)
         Lo_rays.d = -Lo_rays.d
 
@@ -363,11 +343,10 @@ class RadianceCache:
         dr.eval(rays)
         # find offset using gt_geometry raytrace
         first_hit = self.mi_scene.ray_intersect_preliminary(rays)
-        max_extent = dr.max(self.gs_scene.bbox().extents())
         offset = dr.select(
             first_hit.is_valid(), 
             0.5 * first_hit.t,
-            0.1 * max_extent)
+            0.1 * self.max_extent)
         dr.eval(rays, offset)
 
         rays.o += offset * rays.d
@@ -400,9 +379,7 @@ class RadianceCache:
 
         assert not(dr.any((wi_pdf == 0.0) & (wi_weight != 0.0)))
 
-        # wi_rays = si_wide.spawn_ray(si_wide.to_world(wi_local))
         wi_rays = self._spawn_offset_ray(si_wide, si_wide.to_world(wi_local))
-
         active = wi_weight > 0.0
 
         # Compute Li for each of the incident directions. For each `Li_ray`, trace `SPP_LI` 
@@ -411,60 +388,57 @@ class RadianceCache:
         Li *= wi_weight
         return Li, wi_local, active, rng_state, wi_rays
 
-    # TODO
-    # def eval_Li(self, si_wide: mi.SurfaceInteraction3f, sampler_rt: mi.Sampler, rng_state: int = 0, sampling_method: SamplingMethod = SamplingMethod.Cosine) \
-    #     -> tuple[mi.Color3f, mi.Vector3f, Bool, int]:
-    #     '''
-    #     Inputs:
-    #         - si_wide: SurfaceInteraction3f. Widened array of surface sample points of size [#si * #wi,].
-    #         - sampler: Sampler. The pseudo-random number generator.
-    #         - rng_state: int. The RNG seed.
-    #     Outputs: 
-    #         - Li: mi.Color3f. Flattened array of incident radiances of size [#si * #wi,]. The data 
-    #         is in contiguous order, i.e. the first #wi entries belong to si0, and so on.
-    #         - wi_local: mi.Vector3f. Flattened array of incident directions of size [#si * #wi,].
-    #         - active: dr.Bool. Active lanes.
-    #         - rng_state: int. RNG seed for the next operation involving random numbers.
-    #     '''
-    #     sampler_rt.seed(rng_state, dr.width(si_wide)); rng_state += 0x00FF_FFFF
-    #     uv = sampler_rt.next_2d()
+    def eval_Li(self, si_wide: mi.SurfaceInteraction3f, sampler_rt: mi.Sampler, rng_state: int = 0, sampling_method: SamplingMethod = SamplingMethod.Cosine) \
+        -> tuple[mi.Color3f, mi.Vector3f, Bool, int]:
+        '''
+        Inputs:
+            - si_wide: SurfaceInteraction3f. Widened array of surface sample points of size [#si * #wi,].
+            - sampler: Sampler. The pseudo-random number generator.
+            - rng_state: int. The RNG seed.
+        Outputs: 
+            - Li: mi.Color3f. Flattened array of incident radiances of size [#si * #wi,]. The data 
+            is in contiguous order, i.e. the first #wi entries belong to si0, and so on.
+            - wi_local: mi.Vector3f. Flattened array of incident directions of size [#si * #wi,].
+            - active: dr.Bool. Active lanes.
+            - rng_state: int. RNG seed for the next operation involving random numbers.
+        '''
+        sampler_rt.seed(rng_state, dr.width(si_wide)); rng_state += 0x00FF_FFFF
+        uv = sampler_rt.next_2d()
 
-    #     if sampling_method == SamplingMethod.Emitter:
-    #         # light_pdf is expressed in units of solid angle
-    #         em_wi, em_weight, em_pdf = self.energy_pmf.sample(si_wide, sampler_rt.next_1d(), uv)
+        if sampling_method == SamplingMethod.Emitter:
+            # light_pdf is expressed in units of solid angle
+            em_wi, em_weight, em_pdf = self.energy_pmf.sample(si_wide, sampler_rt.next_1d(), uv)
 
-    #         # Evaluate material pdf and MIS weight
-    #         # max() is needed because this pdf() implementation can return negative values for invalid directions!
-    #         hemi_pdf = dr.maximum(0.0, mi.warp.square_to_cosine_hemisphere_pdf(em_wi))
-    #         mis_weight = dr.select(hemi_pdf > 0.0, balance_heuristic(em_pdf, hemi_pdf), 1.0)
-    #         em_weight *= mis_weight 
-    #         wi_local, wi_pdf, wi_weight = em_wi, em_pdf, em_weight
-    #     elif sampling_method == SamplingMethod.Cosine:
-    #         hemi_wi = mi.warp.square_to_cosine_hemisphere(uv)
-    #         hemi_pdf = dr.maximum(0.0, mi.warp.square_to_cosine_hemisphere_pdf(hemi_wi))
-    #         hemi_weight = dr.select(hemi_pdf > 0.0, dr.rcp(hemi_pdf), 0.0)
+            # Evaluate material pdf and MIS weight
+            # max() is needed because this pdf() implementation can return negative values for invalid directions!
+            hemi_pdf = dr.maximum(0.0, mi.warp.square_to_cosine_hemisphere_pdf(em_wi))
+            mis_weight = dr.select(hemi_pdf > 0.0, balance_heuristic(em_pdf, hemi_pdf), 1.0)
+            em_weight *= mis_weight 
+            wi_local, wi_pdf, wi_weight = em_wi, em_pdf, em_weight
+        elif sampling_method == SamplingMethod.Cosine:
+            hemi_wi = mi.warp.square_to_cosine_hemisphere(uv)
+            hemi_pdf = dr.maximum(0.0, mi.warp.square_to_cosine_hemisphere_pdf(hemi_wi))
+            hemi_weight = dr.select(hemi_pdf > 0.0, dr.rcp(hemi_pdf), 0.0)
 
-    #         # Evaluate light pdf and MIS weight
-    #         # light_pdf is expressed in units of solid angle
-    #         em_pdf = self.energy_pmf.eval_pdf(si_wide, hemi_wi)
-    #         mis_weight = dr.select(em_pdf > 0.0, balance_heuristic(hemi_pdf, em_pdf), 1.0)
-    #         hemi_weight *= mis_weight
-    #         wi_local, wi_pdf, wi_weight = hemi_wi, hemi_pdf, hemi_weight
-    #     else:
-    #         raise NotImplementedError()
+            # Evaluate light pdf and MIS weight
+            # light_pdf is expressed in units of solid angle
+            em_pdf = self.energy_pmf.eval_pdf(si_wide, hemi_wi)
+            mis_weight = dr.select(em_pdf > 0.0, balance_heuristic(hemi_pdf, em_pdf), 1.0)
+            hemi_weight *= mis_weight
+            wi_local, wi_pdf, wi_weight = hemi_wi, hemi_pdf, hemi_weight
+        else:
+            raise NotImplementedError()
 
-    #     assert not(dr.any((wi_pdf == 0.0) & (wi_weight != 0.0)))
+        assert not(dr.any((wi_pdf == 0.0) & (wi_weight != 0.0)))
 
-    #     # wi_rays = si_wide.spawn_ray(si_wide.to_world(wi_local))
-    #     wi_rays = self._spawn_offset_ray(si_wide, si_wide.to_world(wi_local))
+        wi_rays = self._spawn_offset_ray(si_wide, si_wide.to_world(wi_local))
+        active = wi_weight > 0.0
 
-    #     active = wi_weight > 0.0
-
-    #     # Compute Li for each of the incident directions. For each `Li_ray`, trace `SPP_LI` 
-    #     # different MC samples and average them to get the outgoing radiance.
-    #     Li, rng_state = self._pathtrace(wi_rays, sampler_rt, rng_state, active)
-    #     Li *= wi_weight
-    #     return Li, wi_local, active, rng_state
+        # Compute Li for each of the incident directions. For each `Li_ray`, trace `SPP_LI` 
+        # different MC samples and average them to get the outgoing radiance.
+        Li, rng_state = self._pathtrace(wi_rays, sampler_rt, rng_state, active)
+        Li *= wi_weight
+        return Li, wi_local, active, rng_state
 
 
     # TODO
@@ -561,7 +535,8 @@ def compute_loss(
     # if radiance_cache.mi_scene.environment() is not None:
     #     return _compute_loss_envmap(scene_sampler, radiance_cache, trainable_bsdf, num_points, num_wi, num_wo, rng_state)
     
-    return _compute_loss_mat(scene_sampler, radiance_cache, trainable_bsdf, num_points, num_wi, num_wo, rng_state)
+    # return _compute_loss_mat(scene_sampler, radiance_cache, trainable_bsdf, num_points, num_wi, num_wo, rng_state)
+    return _compute_loss_mis(scene_sampler, radiance_cache, trainable_bsdf, num_points, num_wi, num_wo, rng_state)
 
 def _compute_loss_mat(
         scene_sampler: SceneSurfaceSampler, 
@@ -589,8 +564,7 @@ def _compute_loss_mat(
         sampler: mi.Sampler = mi.load_dict({'type': 'independent'})
 
         # Sample `NUM_POINTS` different surface points
-        si, delta_emitter_sample, delta_emitter_Li, rng_state = scene_sampler.sample(num_points, sampler, rng_state)
-        # dr.eval(si, rng_state)
+        si, rng_state = scene_sampler.sample(num_points, sampler, rng_state)
 
         # Build the "wide" `si`
         #     For each surface point `si`, we should sample `num_wi` incident directions.
@@ -664,7 +638,6 @@ def _compute_loss_mat(
             #     ps.show()            
     return loss
 
-# TODO
 def _compute_loss_mis(
         scene_sampler: SceneSurfaceSampler, 
         radiance_cache: RadianceCache, 
@@ -691,7 +664,7 @@ def _compute_loss_mis(
         sampler: mi.Sampler = mi.load_dict({'type': 'independent'})
 
         # Sample `NUM_POINTS` different surface points
-        si, delta_emitter_sample, delta_emitter_Li, rng_state = scene_sampler.sample(num_points, sampler, rng_state)
+        si, rng_state = scene_sampler.sample(num_points, sampler, rng_state)
 
         # Build the "wide" `si`
         #     For each surface point `si`, we should sample `num_wi` incident directions.
@@ -707,26 +680,14 @@ def _compute_loss_mis(
         Li_em, wi_em, active_em, rng_state    = radiance_cache.eval_Li(si_wide, sampler, rng_state, SamplingMethod.Emitter)
         Li_mat, wi_mat, active_mat, rng_state = radiance_cache.eval_Li(si_wide, sampler, rng_state, SamplingMethod.Cosine)
 
-        # RHS delta term: Perform ray visibility test from `si` to the delta emitter
-        vis_rays = si.spawn_ray(delta_emitter_sample.d)
-        vis_rays.maxt = delta_emitter_sample.dist
-        emitter_occluded = radiance_cache.mi_scene.ray_test(vis_rays)
-        delta_emitter_Li &= ~emitter_occluded
-        delta_emitter_wi = si.to_local(delta_emitter_sample.d)
-
         ctx = mi.BSDFContext(mi.TransportMode.Radiance, mi.BSDFFlags.All)
         # Loop through the outgoing directions
         for _ in range(num_wo):
             rhs = dr.zeros(mi.Color3f, num_points)
 
-            # RHS: compute the delta emitter term
-            with dr.resume_grad():
-                f_emitter = trainable_bsdf.eval(ctx, si, wo = delta_emitter_wi)
-                rhs += f_emitter * delta_emitter_Li
-
             # LHS: evaluate the emissive and outgoing radiances
             Le = radiance_cache.eval_Le(si)
-            Lo, active_si, rng_state = radiance_cache.eval_Lo(si, sampler, rng_state)
+            Lo, active_si, rng_state = radiance_cache.eval_Lo(si, sampler, rng_state)[:3]
             lhs = -Le + Lo
 
             # RHS: integrate over the incident directions and update the loss
@@ -744,26 +705,6 @@ def _compute_loss_mis(
             # Update `si_wide` with the new directions
             si_wide.wi = dr.gather(mi.Vector3f, si.wi, dr.repeat(dr.arange(UInt, num_points), num_wi), dr.ReduceMode.Local)
 
-            # if False: #plot or (loss.numpy().item() > 0.01):
-            #     err = dr.squared_norm(lhs - rhs).numpy()
-            #     idx = np.where(err > 0.01)[0]
-            #     bad_si = dr.gather(mi.SurfaceInteraction3f, si, idx)
-                
-            #     # print(np.histogram(err, bins = np.logspace(-4,2, base=10, num=13)))
-            #     print(f"Max error at index {idx} (err = {err[idx]}).")
-            #     print(f"lhs = {lhs.numpy()[:,idx]}")
-            #     print(f"rhs = {rhs.numpy()[:,idx]}")
-            #     print(bad_si)
-            #     print(f"RNG: {rng_state}")
-
-            #     ps.init()
-            #     ps_visualize_textures(radiance_cache.mi_scene, False)
-            #     plot_rays(wi_rays, "wi")
-            #     si_cloud = ps.register_point_cloud("si", si.p.numpy().T)
-            #     si_cloud.add_vector_quantity("wo", si.to_world(si.wi).numpy().T)
-            #     points = ps.register_point_cloud("Bad si", bad_si.p.numpy().T)
-            #     points.add_vector_quantity("wo", bad_si.to_world(bad_si.wi).numpy().T)
-            #     ps.show()            
     return loss
 
 
@@ -794,7 +735,7 @@ def _compute_loss_mis(
 #         sampler: mi.Sampler = mi.load_dict({'type': 'independent'})
 
 #         # Sample `NUM_POINTS` different surface points
-#         si, delta_emitter_sample, delta_emitter_Li, rng_state = scene_sampler.sample(num_points, sampler, rng_state)
+#         si, rng_state = scene_sampler.sample(num_points, sampler, rng_state)
 
 #         # Build the "wide" `si`
 #         si_wide = dr.gather(type(si), si, dr.repeat(dr.arange(UInt, num_points), num_wi), dr.ReduceMode.Local)
