@@ -6,6 +6,7 @@ import mitsuba as mi
 from drjit.auto import Float, UInt, Bool
 from scripts.radiosity.sh_fitting import get_sh_count, fit_sh_on_scene
 from scripts.radiosity.surface_sampler import SceneSurfaceSampler
+from scripts.radiosity.vertex_bsdf import VertexBSDF
 
 def balance_heuristic(pdf1: Float, pdf2: Float, n1: int = 1, n2: int = 1):
     return (n1 * pdf1) * dr.rcp(dr.fma(n1, pdf1, n2 * pdf2))
@@ -150,15 +151,17 @@ class EnergyPMF:
         pdf_angle = dr.select(G > 0.0, pdf_area * dr.rcp(G), 0.0)
 
         # Handle visibility
-        # # TODO: RE-ENABLE occluded term with pace-skipping
+        # # TODO: RE-ENABLE occluded term with space-skipping
         # vis_ray = si.spawn_ray_to(sample_pos)
         # occluded = self.scene.ray_test(vis_ray)
         # print(dr.compress(~occluded))
         occluded = dr.zeros(Bool, dr.width(si))
 
         # MC weight: vis / l_pdf_angle
-        weight = dr.select(~occluded & (pdf_angle > 0.0), dr.rcp(pdf_angle), 0.0)
         d_local = si.to_local(d_world)
+        # TODO: added this filter below. is it consistent with the pdf() implementation?
+        occluded |= d_local.z < 0.0
+        weight = dr.select(~occluded & (pdf_angle > 0.0), dr.rcp(pdf_angle), 0.0)
         return d_local, weight, pdf_angle
     
     def eval_pdf(self, si: mi.SurfaceInteraction3f, wi_local: mi.Vector3f) -> Float:
@@ -215,6 +218,14 @@ def sph_to_dir(theta, phi):
             ct)
         return wi
 
+def dir_to_sph(v):
+    '''
+    Returns (theta, phi)
+    '''
+    theta = dr.safe_acos(v.z)
+    phi = dr.atan2(v.y, v.x)
+    return mi.Point2f(theta, phi)
+
 class RadianceCache:
     def __init__(self, mi_scene: mi.Scene, pcd_path: str):
         '''
@@ -245,9 +256,6 @@ class RadianceCache:
         self.energy_pmf = EnergyPMF(self.gs_scene)
         self.max_extent = dr.max(self.gs_scene.bbox().extents())
 
-        # TODO
-        # merged_dict = scene_dict
-        # self.merged_scene: mi.Scene = mi.load_dict(merged_dict)
 
     def _pathtrace(self, rays: mi.Ray3f, sampler_rt: mi.Sampler, rng_state: int, active: Bool = None) -> tuple[mi.Color3f, int]:
         '''
@@ -267,7 +275,7 @@ class RadianceCache:
     
     def _spawn_offset_ray(self, si: mi.SurfaceInteraction3f, d: mi.Vector3f):
         ray = mi.Ray3f(si.p, d)
-        # TODO: `intersect_preliminary` method
+        # `intersect_preliminary` method
         dr.eval(ray)
         # find offset using gt_geometry raytrace
         first_hit = self.mi_scene.ray_intersect_preliminary(ray)
@@ -310,9 +318,7 @@ class RadianceCache:
         # active = (self.mi_scene.ray_intersect_preliminary(Lo_rays).shape == si.shape)
         # ^ TODO: disabled
 
-        # Pathtrace along `-wo` to get the radiance when looking at `A`. For each `Lo_ray`,
-        # compute `SPP_LO` different pathtraced samples and average them to get the outgoing 
-        # radiance.
+        # Pathtrace along `-wo` to get the radiance when looking at `A`.
         Lo, rng_state = self._pathtrace(Lo_rays, sampler_rt, rng_state, active)
         return Lo, active, rng_state, Lo_rays
 
@@ -355,10 +361,11 @@ class RadianceCache:
         return image_out, rays
 
 
-    def eval_Li_mat(self, si_wide: mi.SurfaceInteraction3f, sampler_rt: mi.Sampler, rng_state: int = 0) \
-        -> tuple[mi.Color3f, mi.Vector3f, Bool, int]:
+    def eval_Li_mat(self, bsdf: VertexBSDF, si_wide: mi.SurfaceInteraction3f, sampler_rt: mi.Sampler, rng_state: int = 0) \
+        -> tuple[mi.Color3f, int]:
         '''
         Inputs:
+            - bsdf: VertexBSDF. The BSDF associated with the surface mesh.
             - si_wide: SurfaceInteraction3f. Widened array of surface sample points of size [#si * #wi,].
             - sampler: Sampler. The pseudo-random number generator.
             - rng_state: int. The RNG seed.
@@ -366,29 +373,31 @@ class RadianceCache:
             - Li: mi.Color3f. Flattened array of incident radiances of size [#si * #wi,]. The data 
             is in contiguous order, i.e. the first #wi entries belong to si0, and so on.
             - wi_local: mi.Vector3f. Flattened array of incident directions of size [#si * #wi,].
-            - active: dr.Bool. Active lanes.
             - rng_state: int. RNG seed for the next operation involving random numbers.
         '''
         sampler_rt.seed(rng_state, dr.width(si_wide)); rng_state += 0x00FF_FFFF
         uv = sampler_rt.next_2d()
+        w = sampler_rt.next_1d()
 
-        hemi_wi = mi.warp.square_to_cosine_hemisphere(uv)
-        hemi_pdf = dr.maximum(0.0, mi.warp.square_to_cosine_hemisphere_pdf(hemi_wi))
+        ctx = mi.BSDFContext()
+        bs, _ = bsdf.sample(ctx, si_wide, w, uv)
+        hemi_wi, hemi_pdf = bs.wo, bs.pdf
         hemi_weight = dr.select(hemi_pdf > 0.0, dr.rcp(hemi_pdf), 0.0)
         wi_local, wi_pdf, wi_weight = hemi_wi, hemi_pdf, hemi_weight
+
 
         assert not(dr.any((wi_pdf == 0.0) & (wi_weight != 0.0)))
 
         wi_rays = self._spawn_offset_ray(si_wide, si_wide.to_world(wi_local))
         active = wi_weight > 0.0
 
-        # Compute Li for each of the incident directions. For each `Li_ray`, trace `SPP_LI` 
-        # different MC samples and average them to get the outgoing radiance.
+        # Compute Li for each of the incident directions
         Li, rng_state = self._pathtrace(wi_rays, sampler_rt, rng_state, active)
         Li *= wi_weight
         return Li, wi_local, active, rng_state, wi_rays
 
-    def eval_Li(self, si_wide: mi.SurfaceInteraction3f, sampler_rt: mi.Sampler, rng_state: int = 0, sampling_method: SamplingMethod = SamplingMethod.Cosine) \
+
+    def eval_Li(self, bsdf: VertexBSDF, si_wide: mi.SurfaceInteraction3f, sampler_rt: mi.Sampler, rng_state: int = 0, sampling_method: SamplingMethod = SamplingMethod.Cosine) \
         -> tuple[mi.Color3f, mi.Vector3f, Bool, int]:
         '''
         Inputs:
@@ -404,28 +413,30 @@ class RadianceCache:
         '''
         sampler_rt.seed(rng_state, dr.width(si_wide)); rng_state += 0x00FF_FFFF
         uv = sampler_rt.next_2d()
+        w = sampler_rt.next_1d()
+        ctx = mi.BSDFContext()
 
         if sampling_method == SamplingMethod.Emitter:
             # light_pdf is expressed in units of solid angle
-            em_wi, em_weight, em_pdf = self.energy_pmf.sample(si_wide, sampler_rt.next_1d(), uv)
+            em_wi, em_weight, em_pdf = self.energy_pmf.sample(si_wide, w, uv)
 
             # Evaluate material pdf and MIS weight
             # max() is needed because this pdf() implementation can return negative values for invalid directions!
-            hemi_pdf = dr.maximum(0.0, mi.warp.square_to_cosine_hemisphere_pdf(em_wi))
-            mis_weight = dr.select(hemi_pdf > 0.0, balance_heuristic(em_pdf, hemi_pdf), 1.0)
-            em_weight *= mis_weight 
+            mat_pdf = bsdf.pdf(ctx, si_wide, wo = em_wi)
+            mis_weight = dr.select(mat_pdf > 0.0, balance_heuristic(em_pdf, mat_pdf), 1.0)
+            em_weight *= mis_weight
             wi_local, wi_pdf, wi_weight = em_wi, em_pdf, em_weight
         elif sampling_method == SamplingMethod.Cosine:
-            hemi_wi = mi.warp.square_to_cosine_hemisphere(uv)
-            hemi_pdf = dr.maximum(0.0, mi.warp.square_to_cosine_hemisphere_pdf(hemi_wi))
-            hemi_weight = dr.select(hemi_pdf > 0.0, dr.rcp(hemi_pdf), 0.0)
+            bs = bsdf.sample(ctx, si_wide, w, uv)[0]
+            mat_wi, mat_pdf = bs.wo, bs.pdf
+            mat_weight = dr.select(mat_pdf > 0.0, dr.rcp(mat_pdf), 0.0)
 
             # Evaluate light pdf and MIS weight
             # light_pdf is expressed in units of solid angle
-            em_pdf = self.energy_pmf.eval_pdf(si_wide, hemi_wi)
-            mis_weight = dr.select(em_pdf > 0.0, balance_heuristic(hemi_pdf, em_pdf), 1.0)
-            hemi_weight *= mis_weight
-            wi_local, wi_pdf, wi_weight = hemi_wi, hemi_pdf, hemi_weight
+            em_pdf = self.energy_pmf.eval_pdf(si_wide, mat_wi)
+            mis_weight = dr.select(em_pdf > 0.0, balance_heuristic(mat_pdf, em_pdf), 1.0)
+            mat_weight *= mis_weight
+            wi_local, wi_pdf, wi_weight = mat_wi, mat_pdf, mat_weight
         else:
             raise NotImplementedError()
 
@@ -577,7 +588,7 @@ def _compute_loss_mat(
         si_wide = dr.gather(type(si), si, dr.repeat(dr.arange(UInt, num_points), num_wi), dr.ReduceMode.Local)
 
         # RHS: Evaluate incident directions
-        Li_mat, wi_mat, active_mat, rng_state = radiance_cache.eval_Li_mat(si_wide, sampler, rng_state)[:4]
+        Li_mat, wi_mat, active_mat, rng_state = radiance_cache.eval_Li_mat(trainable_bsdf, si_wide, sampler, rng_state)[:2]
 
         # TODO: disabled
         # # RHS delta term: Perform ray visibility test from `si` to the delta emitter
@@ -587,7 +598,7 @@ def _compute_loss_mat(
         # delta_emitter_Li &= ~emitter_occluded
         # delta_emitter_wi = si.to_local(delta_emitter_sample.d)
 
-        ctx = mi.BSDFContext(mi.TransportMode.Radiance, mi.BSDFFlags.All)
+        ctx = mi.BSDFContext()
         # Loop through the outgoing directions
         for _ in range(num_wo):
             rhs = dr.zeros(mi.Color3f, num_points)
@@ -604,7 +615,7 @@ def _compute_loss_mat(
 
             # RHS: integrate over the incident directions and update the loss
             with dr.resume_grad():
-                integrand = Li_mat * trainable_bsdf.eval(ctx, si = si_wide, wo = wi_mat, active = active_mat)
+                integrand = Li_mat * trainable_bsdf.eval(ctx, si_wide, wo = wi_mat, active = active_mat)
                 rhs += dr.block_reduce(dr.ReduceOp.Add, integrand, block_size = num_wi) / num_wi
                 residuals = dr.select(active_si, dr.squared_norm(lhs - rhs), 0.0)
                 loss += 0.5 * dr.mean(residuals) / num_wo
@@ -637,6 +648,7 @@ def _compute_loss_mat(
             #     points.add_vector_quantity("wo", bad_si.to_world(bad_si.wi).numpy().T)
             #     ps.show()            
     return loss
+
 
 def _compute_loss_mis(
         scene_sampler: SceneSurfaceSampler, 
@@ -677,10 +689,10 @@ def _compute_loss_mis(
         si_wide = dr.gather(type(si), si, dr.repeat(dr.arange(UInt, num_points), num_wi), dr.ReduceMode.Local)
 
         # RHS: Evaluate incident directions
-        Li_em, wi_em, active_em, rng_state    = radiance_cache.eval_Li(si_wide, sampler, rng_state, SamplingMethod.Emitter)
-        Li_mat, wi_mat, active_mat, rng_state = radiance_cache.eval_Li(si_wide, sampler, rng_state, SamplingMethod.Cosine)
+        Li_em,  wi_em,  active_em,  rng_state = radiance_cache.eval_Li(trainable_bsdf, si_wide, sampler, rng_state, SamplingMethod.Emitter)
+        Li_mat, wi_mat, active_mat, rng_state = radiance_cache.eval_Li(trainable_bsdf, si_wide, sampler, rng_state, SamplingMethod.Cosine)
 
-        ctx = mi.BSDFContext(mi.TransportMode.Radiance, mi.BSDFFlags.All)
+        ctx = mi.BSDFContext()
         # Loop through the outgoing directions
         for _ in range(num_wo):
             rhs = dr.zeros(mi.Color3f, num_points)
@@ -692,8 +704,8 @@ def _compute_loss_mis(
 
             # RHS: integrate over the incident directions and update the loss
             with dr.resume_grad():
-                integrand = Li_mat * trainable_bsdf.eval(ctx, si = si_wide, wo = wi_mat, active = active_mat) \
-                           + Li_em * trainable_bsdf.eval(ctx, si = si_wide, wo = wi_em,  active = active_em)
+                integrand = Li_mat * trainable_bsdf.eval(ctx, si_wide, wo = wi_mat, active = active_mat) \
+                           + Li_em * trainable_bsdf.eval(ctx, si_wide, wo = wi_em,  active = active_em)
                 rhs += dr.block_reduce(dr.ReduceOp.Add, integrand, block_size = num_wi) / num_wi
                 residuals = dr.select(active_si, dr.squared_norm(lhs - rhs), 0.0)
                 loss += 0.5 * dr.mean(residuals) / num_wo
