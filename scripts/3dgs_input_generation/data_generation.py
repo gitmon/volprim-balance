@@ -7,14 +7,13 @@ import numpy as np
 import drjit as dr
 from drjit.auto.ad import Float, UInt
 import mitsuba as mi
-import open3d as o3d
+from plyfile import PlyData, PlyElement
 
-# HOME_DIR = "/home/jonathan/Documents/gaussian-splatting/datasets/mitsuba"
 HOME_DIR = "/home/jonathan/Documents/volprim-balance/3dgs_input"
 
 # ----------------- Point cloud generation ------------------
 
-def generate_point_cloud(scene: mi.Scene, num_points: int) -> tuple[np.ndarray, np.ndarray]:
+def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int = 32768) -> tuple[np.ndarray, np.ndarray]:
     """
     Generate a point cloud on the surfaces of the scene.
     """
@@ -28,11 +27,39 @@ def generate_point_cloud(scene: mi.Scene, num_points: int) -> tuple[np.ndarray, 
     surface_samples = sampled_shape.sample_position(0.0, sampler.next_2d())
 
     si = mi.SurfaceInteraction3f(surface_samples, mi.Color0f())
-    surface_colors = sampled_shape.bsdf().eval_diffuse_reflectance(si)
+    si.shape = sampled_shape
+    si.wi = -si.n
+
+    # Compute the points' colors. If surface is an emitter, use the emitted radiance; 
+    # otherwise, use the surface BSDF's albedo.
+    surface_colors = dr.select(
+        sampled_shape.is_emitter(), 
+        sampled_shape.emitter().eval(si), 
+        sampled_shape.bsdf().eval_diffuse_reflectance(si))
 
     point_positions = si.p.numpy().T
     point_colors = surface_colors.numpy().T
     point_normals = si.n.numpy().T
+
+    # Handle envmap samples
+    envmap = scene.environment()
+    if envmap is not None:
+        max_extent = scene.bbox().bounding_sphere().radius
+        sampler.seed(1, wavefront_size = num_points_env)
+        directions = mi.warp.square_to_uniform_sphere(sampler.next_2d())
+        positions = 3.0 * max_extent * directions
+        normals = -directions
+        si_tmp = dr.zeros(mi.SurfaceInteraction3f, num_points_env)
+        si_tmp.wi = -directions
+        colors = envmap.eval(si_tmp)
+
+        positions_env = positions.numpy().T
+        colors_env = colors.numpy().T
+        normals_env = normals.numpy().T
+        point_positions = np.vstack((point_positions, positions_env))
+        point_colors = np.vstack((point_colors, colors_env))
+        point_normals = np.vstack((point_normals, normals_env))
+
     return {
         "positions": point_positions, 
         "colors": point_colors, 
@@ -46,12 +73,23 @@ def write_point_cloud(scene: mi.Scene, output_path: str, num_points: int, filena
     contain three attributes: the vertex positions, colors, and surface normals.
     """
     points = generate_point_cloud(scene, num_points)
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector( points["positions"])
-    pcd.colors = o3d.utility.Vector3dVector( points["colors"])
-    pcd.normals = o3d.utility.Vector3dVector(points["normals"])
+    xyz = points["positions"]
+    normals = points["normals"]
+    rgb = points["colors"]
+
+    dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+            ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+            ('red', 'f4'), ('green', 'f4'), ('blue', 'f4')]
+    
+    attributes = np.concatenate((xyz, normals, rgb), axis=1)
+    elements = np.empty(xyz.shape[0], dtype=dtype)
+    elements[:] = list(map(tuple, attributes))
+
+    # Create the PlyData object and write to file
+    vertex_element = PlyElement.describe(elements, 'vertex')
+    ply_data = PlyData([vertex_element])
     fp = os.path.join(output_path, filename)
-    o3d.io.write_point_cloud(fp, pcd)
+    ply_data.write(fp)
 
 # ----------------- Camera pose generation ------------------
 
@@ -105,7 +143,7 @@ def make_hemispherical_cameras(
     targets = origins + (N if outward else -N)
     ups = np.zeros_like(origins); ups[:,1] = 1.0
 
-    mask = (origins[:,1] > center[1]) if tophalf else np.ones(origins.shape[0]).astype(bool)
+    mask = (origins[:,1] > center[1]) if tophalf else (origins[:,1] <= center[1])
     origins = origins[mask]
     targets = targets[mask]
     ups = ups[mask]
@@ -347,15 +385,21 @@ class DataGenerator:
 
         ps.show()
 
+        for camera_id in range(len(poses.origin)):
+            ps.remove_camera_view(f"cam{camera_id}")
+        plot.remove()
 
 
-
-def render_views_HDR(scene: mi.Scene, output_path: str, camera_params: CameraParameters, camera_poses: CameraPose, denoise: bool = True) -> None:
+def render_views_HDR(
+        scene: mi.Scene, 
+        output_path: str, 
+        camera_params: CameraParameters, 
+        camera_poses: CameraPose, 
+        denoise: bool = True, 
+        ) -> None:
     """
     Render the views from the set of input camera poses and write them to disk.
     """
-    # split_name = "train" if split == DataSplit.Train else "test"
-
     if denoise:
         integrator = mi.load_dict({
             'type': 'aov',
@@ -383,13 +427,6 @@ def render_views_HDR(scene: mi.Scene, output_path: str, camera_params: CameraPar
         fp = os.path.join(output_path, "train", f"{camera_id}.exr")
         mi.util.write_bitmap(fp, image, write_async=True)
 
-        # # write LDR images
-        # exposures = [0.2, 0.4, 0.6, 0.8, 1.0]
-        # for exp_id, scale_factor in enumerate(exposures):
-        #     fp = os.path.join(output_path, "images", f"{camera_id}_{exp_id}.png")
-        #     _image = mi.Bitmap(scale_factor * mi.TensorXf(image))
-        #     mi.util.write_bitmap(fp, _image, write_async=True)
-
 
 def write_poses_to_json_HDR(output_path: str, camera_params: CameraParameters, poses: CameraPose) -> None:
     """
@@ -408,7 +445,7 @@ def write_poses_to_json_HDR(output_path: str, camera_params: CameraParameters, p
     frames = []
     for camera_id, (origin, target, up) in enumerate(zip(poses.origin, poses.target, poses.up)):
         frame = {
-            "file_path": f"{camera_id}",
+            "file_path": f"train/{camera_id}",
         }
         to_world_matrix = mi.ScalarTransform4f().look_at(tuple(origin), tuple(target), tuple(up))
         to_world_matrix = to_world_matrix.matrix.numpy()
@@ -429,6 +466,10 @@ def write_poses_to_json_HDR(output_path: str, camera_params: CameraParameters, p
     with open(filepath, 'w') as f:
         json.dump(json_data, f, ensure_ascii=False, indent=4)
 
+    filepath = os.path.join(output_path, f"transforms_test.json")
+    with open(filepath, 'w') as f:
+        json.dump(json_data, f, ensure_ascii=False, indent=4)
+
 
 class DataGeneratorHDR(DataGenerator):
     def __init__(self, scene: mi.Scene, dataset_name: str, camera_params: CameraParameters, camera_poses: CameraPose, pointcloud_size: int = 1 << 20, use_denoiser: bool = False):
@@ -437,18 +478,6 @@ class DataGeneratorHDR(DataGenerator):
     def run(self):
         try:
             os.makedirs(os.path.join(self.output_path, "train"))
-        except FileExistsError:
-            # directory already exists
-            pass
-
-        try:
-            os.makedirs(os.path.join(self.output_path, "images"))
-        except FileExistsError:
-            # directory already exists
-            pass
-
-        try:
-            os.makedirs(os.path.join(self.output_path, "sparse", "0"))
         except FileExistsError:
             # directory already exists
             pass
@@ -462,5 +491,4 @@ class DataGeneratorHDR(DataGenerator):
         print("Training data render complete.")
 
         # Generate point cloud
-        pc_path = os.path.join(self.output_path, "sparse", "0")
-        write_point_cloud(self.scene, pc_path, self.pointcloud_size, filename="points3D.ply")
+        write_point_cloud(self.scene, self.output_path, self.pointcloud_size)

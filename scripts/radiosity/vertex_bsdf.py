@@ -349,7 +349,33 @@ def bsdf_sample(
 
 # ----------------------- BSDF class: Principled -----------------------
 
-class Principled:
+class VertexBSDF:
+    def __init__(self):
+        self.bsdf_keys = []
+
+    def sample(self, ctx: mi.BSDFContext, si: mi.SurfaceInteraction3f, sample1: Float, sample2: mi.Point2f, active: Bool = True) -> tuple[mi.BSDFSample3f, mi.Color3f]:
+        raise NotImplementedError()
+
+    def eval(self, ctx: mi.BSDFContext, si: mi.SurfaceInteraction3f, wo: mi.Vector3f, active: Bool = True) -> mi.Color3f:
+        raise NotImplementedError()
+
+    def pdf(self, ctx: mi.BSDFContext, si: mi.SurfaceInteraction3f, wo: mi.Vector3f, active: Bool = True) -> Float:
+        raise NotImplementedError()
+    
+    def register_params(self, opt: mi.ad.Optimizer, params: mi.SceneParameters):
+        scene_param_keys = []
+        for bsdf_key in self.bsdf_keys:
+            scene_param_keys += [param for param in params.keys() if bsdf_key in param]
+        
+        for key in scene_param_keys:
+            dr.enable_grad(params[key])
+            opt[key] = params[key]
+        
+        params.update(opt)
+        return scene_param_keys
+
+
+class Principled(VertexBSDF):
     '''
     Duplicate implementation of the principled BSDF which allows material parameters to be queried from the 
     _vertex attributes_ of a mesh, rather than via texture lookups. This is needed to render and optimize
@@ -367,6 +393,7 @@ class Principled:
         self.specular        = specular
         self.spec_srate = 1.0
         self.diff_refl_srate = 1.0
+        self.bsdf_keys = []
 
     def sample(self, ctx: mi.BSDFContext, si: mi.SurfaceInteraction3f, sample1: Float, sample2: mi.Point2f, active: Bool = True) -> tuple[mi.BSDFSample3f, mi.Color3f]:
         return bsdf_sample(si, sample1, sample2, active, self.specular, self.has_anisotropic, self.has_metallic, self.has_spec_tint)
@@ -380,8 +407,8 @@ class Principled:
     def initialize_mesh_attributes(
             self,
             mesh: mi.Mesh, 
-            m_base_color: mi.Color3f | list, 
-            m_roughness: float,
+            m_base_color: mi.Color3f | list = [0.5, 0.5, 0.5], 
+            m_roughness: float = 0.5,
             m_metallic: float = None, 
             m_anisotropic: float = None,
             m_spec_tint: float = None) -> list[str]:
@@ -402,41 +429,43 @@ class Principled:
         color = mi.Color3f([float(x) for x in m_base_color])
         vertex_colors = dr.gather(mi.Color3f, color, dr.zeros(UInt, Nv))
 
-        param_keys = []
+        bsdf_keys = []
 
         if not(mesh.has_attribute("vertex_bsdf_base_color")):
             mesh.add_attribute("vertex_bsdf_base_color", 3, dr.ravel(vertex_colors))
-        param_keys.append("vertex_bsdf_base_color")
+        bsdf_keys.append("vertex_bsdf_base_color")
         
         if not(mesh.has_attribute("vertex_bsdf_roughness")):
             mesh.add_attribute("vertex_bsdf_roughness", 1, dr.full(Float, m_roughness, Nv))
-        param_keys.append("vertex_bsdf_roughness")
+        bsdf_keys.append("vertex_bsdf_roughness")
         
         if self.has_metallic:
             assert m_metallic is not None, "`m_metallic` is not set!"
             if not(mesh.has_attribute("vertex_bsdf_metallic")):
                 mesh.add_attribute("vertex_bsdf_metallic", 1, dr.full(Float, m_metallic, Nv))
-            param_keys.append("vertex_bsdf_metallic")
+            bsdf_keys.append("vertex_bsdf_metallic")
 
         if self.has_anisotropic:
             assert m_anisotropic is not None, "`m_anisotropic` is not set!"
             if not(mesh.has_attribute("vertex_bsdf_anisotropic")):
                 mesh.add_attribute("vertex_bsdf_anisotropic", 1, dr.full(Float, m_anisotropic, Nv))
-            param_keys.append("vertex_bsdf_anisotropic")
+            bsdf_keys.append("vertex_bsdf_anisotropic")
 
         if self.has_spec_tint:
             assert m_spec_tint is not None, "`m_spec_tint` is not set!"
             if not(mesh.has_attribute("vertex_bsdf_spec_tint")):
                 mesh.add_attribute("vertex_bsdf_spec_tint", 1, dr.full(Float, m_spec_tint, Nv))
-            param_keys.append("vertex_bsdf_spec_tint")
+            bsdf_keys.append("vertex_bsdf_spec_tint")
 
-        return param_keys
+        self.bsdf_keys = bsdf_keys
+
+        return bsdf_keys.copy()
 
 # ----------------------- BSDF class: Lambertian diffuse -----------------------
 
-class Diffuse:
+class Diffuse(VertexBSDF):
     def __init__(self):
-        pass
+        self.bsdf_keys = []
 
     def sample(self, ctx: mi.BSDFContext, si: mi.SurfaceInteraction3f, sample1: Float, sample2: mi.Point2f, active: Bool = True) -> tuple[mi.BSDFSample3f, mi.Color3f]:
         cos_theta_i = mi.Frame3f.cos_theta(si.wi)
@@ -479,7 +508,7 @@ class Diffuse:
     def initialize_mesh_attributes(
             self,
             mesh: mi.Mesh, 
-            m_base_color: mi.Color3f | list) -> list[str]:
+            m_base_color: mi.Color3f | list = [0.5, 0.5, 0.5]) -> list[str]:
         '''
         On a given input triangle mesh, initialize vertex attribute buffers for each of the optimizable 
         BSDF parameters.
@@ -494,9 +523,12 @@ class Diffuse:
         color = mi.Color3f([float(x) for x in m_base_color])
         vertex_colors = dr.gather(mi.Color3f, color, dr.zeros(UInt, Nv))
 
-        param_keys = []
+        bsdf_keys = []
 
         if not(mesh.has_attribute("vertex_bsdf_base_color")):
             mesh.add_attribute("vertex_bsdf_base_color", 3, dr.ravel(vertex_colors))
-        param_keys.append("vertex_bsdf_base_color")
-        return param_keys
+        bsdf_keys.append("vertex_bsdf_base_color")
+
+        self.bsdf_keys = bsdf_keys
+
+        return bsdf_keys.copy()

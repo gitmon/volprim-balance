@@ -124,8 +124,8 @@ def render_base_color(scene: mi.Scene, img_res = None, write_img = True, filenam
     '''
     if img_res is None:
         film_size = scene.sensors()[0].film().size()
-        img_res = (film_size[0], film_size[1])
-    us, vs = dr.meshgrid(dr.linspace(Float, 0.0, 1.0, img_res[0]), dr.linspace(Float, 0.0, 1.0, img_res[1]))
+        img_res = (film_size.y, film_size.x)
+    us, vs = dr.meshgrid(dr.linspace(Float, 0.0, 1.0, img_res[1]), dr.linspace(Float, 0.0, 1.0, img_res[0]))
     sensor = scene.sensors()[0]
     rays, _ = sensor.sample_ray(0.0, 0.0, mi.Point2f(us, vs), dr.zeros(mi.Point2f))
     si = scene.ray_intersect(rays)
@@ -148,8 +148,8 @@ def render_attributes(scene: mi.Scene, img_res = None, write_img = True, filenam
     '''
     if img_res is None:
         film_size = scene.sensors()[0].film().size()
-        img_res = (film_size[0], film_size[1])
-    us, vs = dr.meshgrid(dr.linspace(Float, 0.0, 1.0, img_res[0]), dr.linspace(Float, 0.0, 1.0, img_res[1]))
+        img_res = (film_size.y, film_size.x)
+    us, vs = dr.meshgrid(dr.linspace(Float, 0.0, 1.0, img_res[1]), dr.linspace(Float, 0.0, 1.0, img_res[0]))
     sensor = scene.sensors()[0]
     rays, _ = sensor.sample_ray(0.0, 0.0, mi.Point2f(us, vs), dr.zeros(mi.Point2f))
     si = scene.ray_intersect(rays)
@@ -200,8 +200,8 @@ def render_attributes_gt(scene: mi.Scene, img_res = None, write_img = True, file
     '''
     if img_res is None:
         film_size = scene.sensors()[0].film().size()
-        img_res = (film_size[0], film_size[1])
-    us, vs = dr.meshgrid(dr.linspace(Float, 0.0, 1.0, img_res[0]), dr.linspace(Float, 0.0, 1.0, img_res[1]))
+        img_res = (film_size.y, film_size.x)
+    us, vs = dr.meshgrid(dr.linspace(Float, 0.0, 1.0, img_res[1]), dr.linspace(Float, 0.0, 1.0, img_res[0]))
     sensor = scene.sensors()[0]
     rays, _ = sensor.sample_ray(0.0, 0.0, mi.Point2f(us, vs), dr.zeros(mi.Point2f))
     si = scene.ray_intersect(rays)
