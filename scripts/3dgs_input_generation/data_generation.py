@@ -13,7 +13,7 @@ HOME_DIR = "/home/jonathan/Documents/volprim-balance/3dgs_input"
 
 # ----------------- Point cloud generation ------------------
 
-def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int = 32768) -> tuple[np.ndarray, np.ndarray]:
+def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int = 32768) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate a point cloud on the surfaces of the scene.
     """
@@ -37,28 +37,45 @@ def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int =
         sampled_shape.emitter().eval(si), 
         sampled_shape.bsdf().eval_diffuse_reflectance(si))
 
-    point_positions = si.p.numpy().T
-    point_colors = surface_colors.numpy().T
-    point_normals = si.n.numpy().T
+    mesh_positions  = si.p.numpy().T
+    mesh_colors     = surface_colors.numpy().T
+    mesh_normals    = si.n.numpy().T
+
+    point_positions = mesh_positions
+    point_colors    = mesh_colors
+    point_normals   = mesh_normals
 
     # Handle envmap samples
     envmap = scene.environment()
     if envmap is not None:
+        # Contribution 1: uniform points
         max_extent = scene.bbox().bounding_sphere().radius
         sampler.seed(1, wavefront_size = num_points_env)
         directions = mi.warp.square_to_uniform_sphere(sampler.next_2d())
-        positions = 3.0 * max_extent * directions
-        normals = -directions
         si_tmp = dr.zeros(mi.SurfaceInteraction3f, num_points_env)
         si_tmp.wi = -directions
-        colors = envmap.eval(si_tmp)
+        positions_sph = 3.0 * max_extent * directions
+        normals_sph   = -directions
+        colors_sph    = envmap.eval(si_tmp)
 
-        positions_env = positions.numpy().T
-        colors_env = colors.numpy().T
-        normals_env = normals.numpy().T
-        point_positions = np.vstack((point_positions, positions_env))
-        point_colors = np.vstack((point_colors, colors_env))
-        point_normals = np.vstack((point_normals, normals_env))
+        # Contribution 2: importance-sampled points
+        it_scene = mi.Interaction3f(0.0, 0.0, mi.Color0f(), p=scene.bbox().center(), n=mi.Vector3f(0,0,1))
+        ds, weight = envmap.sample_direction(it_scene, sampler.next_2d())
+        positions_imp = 3.0 * max_extent * ds.d
+        colors_imp    = weight * ds.pdf
+        normals_imp   = ds.n
+
+        # Assemble points' data
+        positions_sph = positions_sph.numpy().T
+        colors_sph    = colors_sph.numpy().T
+        normals_sph   = normals_sph.numpy().T
+        positions_imp = positions_imp.numpy().T
+        colors_imp    = colors_imp.numpy().T
+        normals_imp   = normals_imp.numpy().T
+
+        point_positions = np.vstack((mesh_positions, positions_sph, positions_imp))
+        point_colors    = np.vstack((mesh_colors,    colors_sph,    colors_imp))
+        point_normals   = np.vstack((mesh_normals,   normals_sph,   normals_imp))
 
     return {
         "positions": point_positions, 
