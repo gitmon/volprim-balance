@@ -8,10 +8,20 @@ from drjit.auto import Float, UInt, Bool
 mi.set_variant('cuda_ad_rgb')
 
 import numpy as np
-from scripts.restir.reservoir import ReservoirVector3f, MultiReservoirVector3f, MultiReservoirVector3f__
+from scripts.restir.reservoir import ReservoirVector3f, MultiReservoirVector3f
 
 def balance_heuristic(pdf_a: Float, pdf_b: Float) -> Float:
      return pdf_a * dr.rcp(pdf_a + pdf_b)
+
+def I_exact():
+    # return np.array([dr.pi * dr.pi / 2, dr.pi, 0.0])
+
+    # a = 0.01
+    # return np.array([dr.pi * dr.pi / 2, a * dr.pi + dr.pi * dr.pi / 2, 0.0])
+    
+    cos_t = 0.7 # 0.95
+    I = 2.0 * dr.pi * (1.0 - cos_t)
+    return np.array([I, I, 0.0])
 
 def eval_integrand(d: mi.Vector3f, si: mi.SurfaceInteraction3f) -> mi.Color3f:
         '''
@@ -19,14 +29,26 @@ def eval_integrand(d: mi.Vector3f, si: mi.SurfaceInteraction3f) -> mi.Color3f:
         hemisphere admits an analytic solution: [0.5 * pi ** 2, pi, 0.0].
         '''
         d_local = si.to_local(d)
+        # # Analytic solution: (dr.pi*dr.pi/2, dr.pi, 0.0)
         # Le = mi.Color3f(
         #       mi.Frame3f.sin_theta(d_local), 
         #       mi.Frame3f.cos_theta(d_local), 
         #       0.0)
-        Le = mi.Color3f(
-              mi.Frame3f.sin_theta(d_local), 
-              mi.Frame3f.sin_theta(d_local) + 0.01 * mi.Frame3f.cos_theta(d_local), 
-              0.0)
+        # return Le
+
+        # # Analytic solution: (pi*pi/2, 0.01*pi + pi*pi/2, 0.0)
+        # Le = mi.Color3f(
+        #       mi.Frame3f.sin_theta(d_local), 
+        #       mi.Frame3f.sin_theta(d_local) + 0.01 * mi.Frame3f.cos_theta(d_local), 
+        #       0.0)
+        # return Le
+
+        # # Analytic solution: 2.0 * pi * (1.0 - cos_t)
+        cos_t = 0.7 # 0.95
+        v = mi.Vector3f(dr.inv_sqrt_two, 0.0, dr.inv_sqrt_two)
+        v = dr.normalize(v)
+        d_dot_v = dr.select(dr.dot(d_local, v) >= cos_t, 1.0, 0.0)
+        Le = mi.Color3f(d_dot_v, d_dot_v, 0.0)
         return Le
 
 def eval_target_function(d: mi.Vector3f, si: mi.SurfaceInteraction3f) -> Float:
@@ -180,7 +202,7 @@ def run_multislot_temporal(
     STREAM_LENGTH = M
     NUM_STREAMS = dr.width(si)
 
-    result, rsv_prev = run_multislot__(si, sampler, M, num_slots, rng_state); rng_state += 0x00FF_0000
+    result, rsv_prev = run_multislot(si, sampler, M, num_slots, rng_state); rng_state += 0x00FF_0000
 
     target_func = lambda ds: eval_target_function(ds, si)
     si_wide = dr.gather(type(si), si, dr.repeat(dr.arange(UInt, NUM_STREAMS), STREAM_LENGTH))
@@ -192,7 +214,7 @@ def run_multislot_temporal(
         # print(f"=================== Frame {frame_i+1} ===================")
         # print(f"Contents of rsv_prev: {rsv_prev.sample}")
         result = dr.zeros(mi.Color3f, NUM_STREAMS)
-        rsv_seed = MultiReservoirVector3f__(NUM_STREAMS, num_slots)
+        rsv_seed = MultiReservoirVector3f(NUM_STREAMS, num_slots)
 
         # Draw samples from the proposal distribution
         d_sample, pdf = proposal_direction(si, sampler.next_2d())
@@ -211,7 +233,7 @@ def run_multislot_temporal(
         rsv_seed.add_proposals_vectorized(STREAM_LENGTH, d_sample, sampler, w)
 
         # # Temporal reuse
-        rsv_reuse = MultiReservoirVector3f__(NUM_STREAMS, num_slots)
+        rsv_reuse = MultiReservoirVector3f(NUM_STREAMS, num_slots)
         target_curr, target_prev = target_func, target_func
 
         for slot_idx in range(num_slots):
@@ -297,20 +319,14 @@ def run_singleslot_temporal_opt(
 
         # Add current iteration's reservoir
         rsv_curr.eval_target(target_curr)
-        p_hat_curr = rsv_curr.p_hat
         p_hat_prev = target_prev(rsv_curr.sample)
-        mis_curr = balance_heuristic(
-             p_hat_curr * 1, 
-             p_hat_prev * 20)
+        mis_curr = balance_heuristic(rsv_curr.p_hat, p_hat_prev * 20)
         rsv_curr.reinitialize(mis_curr)
 
         # Add previous iteration's reservoir
         prev_sample, prev_W = rsv_prev.get_sample(target_prev)
-        p_hat_curr = target_curr(prev_sample)
         p_hat_prev = target_prev(prev_sample)
-        mis_prev = balance_heuristic(
-             p_hat_prev * 20, 
-             p_hat_curr * 1)
+        mis_prev = balance_heuristic(p_hat_prev * 20, target_curr(prev_sample))
         rsv_curr.add_proposal(prev_sample, sampler_.next_1d(), mis_prev * p_hat_prev * prev_W, rsv_prev.c)
 
         # Evaluate integrand and compute integral
@@ -367,49 +383,6 @@ def run_multislot(
     return result, rsv
 
 
-def run_multislot__(
-          si: mi.SurfaceInteraction3f, 
-          sampler: mi.Sampler, 
-          M: int, 
-          num_slots: int, 
-          rng_state: int = 0) -> tuple[mi.Color3f, MultiReservoirVector3f__]:
-    '''
-    Compute the hemispheric integral of f(x) using reservoir sampling with `num_slots` 
-    slots. All slots share the same input stream of proposals, of length `M`.
-    '''
-    STREAM_LENGTH = M
-    NUM_STREAMS = dr.width(si)
-
-    result = dr.zeros(mi.Color3f, NUM_STREAMS)
-    rsv = MultiReservoirVector3f__(NUM_STREAMS, num_slots)
-    si_wide = dr.gather(type(si), si, dr.repeat(dr.arange(UInt, NUM_STREAMS), STREAM_LENGTH))
-    sampler.seed(rng_state, NUM_STREAMS * STREAM_LENGTH)
-
-    # Draw samples from the proposal distribution
-    d_sample, pdf = proposal_direction(si, sampler.next_2d())
-
-    # Contrib. weight of drawn sample, `s.W`
-    ds_W = dr.rcp(pdf)
-
-    # Compute `p_hat`
-    p_hat = eval_target_function(d_sample, si_wide)
-
-    # Compute weight `w`
-    mis_weight = 1.0 / M
-    w = dr.select(pdf > 0.0, mis_weight * p_hat * ds_W, 0.0)
-
-    # Add samples to reservoir
-    rsv.add_proposals_vectorized(STREAM_LENGTH, d_sample, sampler, w)
-
-    # Evaluate integrand and compute integral
-    target_eval = lambda ds: eval_target_function(ds, si)
-    for slot_idx in range(num_slots):
-        d, contrib_weight = rsv.get_sample(target_eval, slot_idx)
-        result += eval_integrand(d, si) * contrib_weight
-    result /= num_slots
-    return result, rsv
-
-
 def run_naive(si, sampler, M, rng_state: int = 0):
     '''
     Compute the hemispheric integral of f(x) using the naive method of importance 
@@ -424,13 +397,14 @@ def run_naive(si, sampler, M, rng_state: int = 0):
     result = dr.mean(integrand * dr.rcp(pdf), axis=1)
     return result
 
+
 def test_reservoir():
     si = dr.zeros(mi.SurfaceInteraction3f)
     si.n = mi.Vector3f(0.0, 0.0, 1.0)
     si.sh_frame = mi.Frame3f(si.n)
 
     sampler = mi.load_dict({'type': 'independent'})
-    res_exact = np.array([dr.pi * dr.pi * 0.5, dr.pi, 0.0])
+    res_exact = I_exact()
 
     M = 64
     # Run naive integrator
@@ -462,7 +436,7 @@ def test_reservoir():
     NUM_FRAMES = 64     # TODO
     I_temporal1 = []
     for rng_state in range(50):
-         I = run_singleslot_temporal(si, sampler, M, NUM_FRAMES, rng_state)
+         I = run_singleslot_temporal_opt(si, sampler, M, NUM_FRAMES, rng_state)
          I_temporal1.append(I.numpy().T)
     I_temporal1 = np.array(I_temporal1).squeeze()
     mean_temporal1, std_temporal1 = np.mean(I_temporal1, axis=0), np.std(I_temporal1, axis=0)
@@ -475,7 +449,7 @@ def test_reservoir():
     I_temporal2 = np.array(I_temporal2).squeeze()
     mean_temporal2, std_temporal2 = np.mean(I_temporal2, axis=0), np.std(I_temporal2, axis=0)
 
-    with np.printoptions(precision=3, suppress=True):
+    with np.printoptions(precision=5, suppress=True):
         print(res_exact)
         print(f"Naive:\t\t{mean_naive} +- {std_naive}")
         print(f"Single:\t\t{mean_single} +- {std_single}")
