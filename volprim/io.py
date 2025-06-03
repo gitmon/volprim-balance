@@ -29,6 +29,8 @@ def get_plugin_type(obj):
     if alias == 'CppADIntegrator':
         plugin_type = {
             "<class 'volprim.integrators.volprim_rf.VolumetricPrimitiveRadianceFieldIntegrator'>": 'volprim_rf',
+            "<class 'volprim.integrators.volprim_pdf.EllipsoidPdfIntegrator'>": 'volprim_pdf',
+            "<class 'volprim.integrators.volprim_pdf.EllipsoidAlphaIntegrator'>": 'volprim_alpha',
             "<class 'volprim.integrators.volprim_tomography.VolumetricPrimitiveTomographyIntegrator'>": 'volprim_tomography',
             "<class 'volprim.integrators.volprim_prb.VolumetricPrimitivesPRBIntegrator'>": 'volprim_prb',
             "<class 'mitsuba.ad.integrators.prb.PRBIntegrator'>": 'prb',

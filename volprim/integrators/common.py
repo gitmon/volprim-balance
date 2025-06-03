@@ -44,6 +44,22 @@ def has_ellipsoids_shapes(scene):
             return True
     return False
 
+def ball_angle_pdf(ellipsoid: Ellipsoid, ray_o, ray_d):
+    S = ellipsoid.scale * ellipsoid.extent
+    R = ellipsoid.rot
+    o_ = (R.T @ (ray_o - ellipsoid.center)) / S
+    d_ = (R.T @ ray_d) / S
+    inv_dsq = dr.rcp(dr.squared_norm(d_))
+    alpha = dr.dot(o_,d_) * inv_dsq
+    beta = (1.0 - dr.squared_norm(o_)) * inv_dsq
+    discr = dr.fma(alpha, alpha, beta)
+    active = discr >= 0.0
+    active &= dr.squared_norm(o_) >= 1.0    # only accept points outside the ellipsoid
+
+    pdf = dr.select(active,
+                    dr.inv_two_pi * dr.rcp(dr.prod(S)) * dr.sqrt(discr) * dr.fma(4.0 * alpha, alpha, beta),
+                    0.0)
+    return pdf, active
 @dataclass
 class Ellipsoid:
     center:  mi.Point3f = mi.Point3f(0)
@@ -51,6 +67,8 @@ class Ellipsoid:
     quat:    mi.Quaternion4f = mi.Quaternion4f(0)
     rot:     mi.Matrix3f = mi.Matrix3f(0)
     extent:  mi.Float = mi.Float(3.0)
+    sh_coeffs: mi.ArrayXf = dr.zeros(mi.ArrayXf, shape=(48,1))
+    opacity: mi.Float = mi.Float(0.0)
 
     @staticmethod
     def ravel(center, scale, quat):
@@ -85,10 +103,30 @@ class Ellipsoid:
                 quat   = mi.Quaternion4f([data[i + 6] for i in range(4)])
                 rot    = dr.quat_to_matrix(quat, size=3)
                 extent = self.eval_attribute_1("extent", si, active)
-                return center, scale, quat, rot, extent
+
+                sh_data = self.eval_attribute_x("sh_coeffs", si, active)
+                opacity_data = self.eval_attribute_1("opacities", si, active)
+                return center, scale, quat, rot, extent, sh_data, opacity_data
             else:
-                return mi.Point3f(0), mi.Vector3f(0), mi.Quaternion4f(0), mi.Matrix3f(0), mi.Float(0)
+                return mi.Point3f(0), \
+                       mi.Vector3f(0), \
+                       mi.Quaternion4f(0), \
+                       mi.Matrix3f(0), \
+                       mi.Float(0), \
+                       dr.zeros(mi.ArrayXf, shape=(48,1)), \
+                       mi.Float(0.0)
         return Ellipsoid(*dr.dispatch(shape, func, prim_index, active))
+    
+    # @staticmethod
+    # def gather_sh(shape, prim_index, active):
+    #     def func(self, prim_index, active):
+    #         if self is not None and self.shape_type() == +mi.ShapeType.Ellipsoids:
+    #             si = dr.zeros(mi.SurfaceInteraction3f)
+    #             si.prim_index = prim_index
+    #             return self.eval_attribute_x("sh_coeffs", si, active)
+    #         else:
+    #             return dr.zeros(dr.cuda.ad.ArrayXf)
+    #     return dr.dispatch(shape, func, prim_index, active)
 
 #-------------------------------------------------------------------------------
 
@@ -143,6 +181,29 @@ class Kernel:
 
     def normalization_factor(self, ellipsoid: Ellipsoid) -> mi.Float:
         raise Exception('Not implemented!')
+
+    def angle_pdf(self,
+            ellipsoid: Ellipsoid,
+            origin: mi.Point3f,
+            direction: mi.Vector3f) -> tuple[mi.Float, mi.Bool]:
+        '''
+        Compute the solid angle pdf for an ellipsoid along the given ray direction. Mathematically, this
+        is a line integral of the kernel probability density along the ray, which is weighted by
+        the squared distance (t ** 2) to account for the geometry factor:
+
+            angle_pdf = integrate(t ** 2 * vol_pdf(o + t * d), t_range=[-infty, infty])
+        '''
+        raise Exception('Not implemented!')
+
+    # def eval_opacity(self, ellipsoid: Ellipsoid, p_local: mi.Point3f, active) -> mi.Float:
+    #     raise Exception('Not implemented!')
+
+    def eval_opacity_ray(self, ellipsoid: Ellipsoid, origin: mi.Point3f, direction: mi.Vector3f, active) -> mi.Float:
+        raise Exception('Not implemented!')
+
+    def eval_sh_emission(self, ellipsoid: Ellipsoid, d: mi.Vector3f, active) -> mi.Color3f:
+        raise Exception('Not implemented!')
+
 
 #-------------------------------------------------------------------------------
 
@@ -241,6 +302,68 @@ class GaussianKernel(Kernel):
     def normalization_factor(self, ellipsoid: Ellipsoid) -> mi.Float:
         s = ellipsoid.scale
         return dr.rcp(0.5 * 4.0 * dr.pi * dr.sqrt((s.x**2 * s.y**2 + s.x**2 * s.z**2 + s.y**2 * s.z**2) / 3.0))
+
+    def angle_pdf(self,
+            ellipsoid: Ellipsoid,
+            origin: mi.Point3f,
+            direction: mi.Vector3f) -> tuple[mi.Float, mi.Bool]:
+        '''
+        Compute the solid angle pdf for an ellipsoid along the given ray direction. Mathematically, this
+        is a line integral of the kernel's volumetric probability density along the ray, which is weighted 
+        by the squared distance (t ** 2) to account for the geometry factor:
+
+            angle_pdf = integrate(t ** 2 * vol_pdf(o + t * d), t_range=[-infty, infty])
+        '''
+        o = (ellipsoid.rot.T @ (origin - ellipsoid.center)) / ellipsoid.scale
+        d = (ellipsoid.rot.T @ direction) / ellipsoid.scale
+        d_dot_d = dr.squared_norm(d)
+        o_dot_o = dr.squared_norm(o)
+        o_dot_d = dr.dot(o, d)
+        d_norm = dr.sqrt(d_dot_d)
+        ratio = dr.square(o_dot_d) * dr.rcp(d_dot_d)
+        vol_pdf = dr.inv_two_pi * dr.rcp(dr.prod(ellipsoid.scale)) * \
+            dr.rcp(d_dot_d * d_norm) * (1.0 + ratio) * \
+            dr.exp(0.5 * (ratio - o_dot_o))
+        
+        active = dr.squared_norm(o) >= dr.square(ellipsoid.extent)  # only accept points outside the ellipsoid
+
+        return dr.select(active, vol_pdf, 0.0), active
+        # return ball_angle_pdf(ellipsoid, origin, direction)
+
+    # def eval_opacity(self, ellipsoid: Ellipsoid, p_local: mi.Point3f, active) -> mi.Float:
+    #     '''
+    #     Evaluate the transmission model on intersected volumetric primitives
+    #     '''
+    #     density = dr.exp(-0.5 * dr.squared_norm(p_local))
+    #     return dr.select(active, dr.minimum(ellipsoid.opacity * density, 0.9999), 0.0)
+
+    def eval_opacity_ray(self, ellipsoid: Ellipsoid, origin: mi.Point3f, direction: mi.Vector3f, active) -> mi.Float:
+        '''
+        Evaluate the transmission model on intersected volumetric primitives
+        '''
+        # Gaussian splatting transmittance model
+        # Find the peak location along the ray. From "3D Gaussian Ray Tracing"
+        o = ellipsoid.rot.T * (origin - ellipsoid.center) / ellipsoid.scale
+        d = ellipsoid.rot.T * direction / ellipsoid.scale
+        t_peak = -dr.dot(o, d) / dr.dot(d, d)
+        p_peak = dr.fma(direction, t_peak, origin)
+        density = self.eval(p_peak, ellipsoid, active)
+        return dr.minimum(ellipsoid.opacity * density, 0.9999)
+
+    def eval_sh_emission(self, ellipsoid: Ellipsoid, d: mi.Vector3f, active) -> mi.Color3f:
+        '''
+        Evaluate the SH directionally emission on intersected volumetric primitives
+        '''
+        sh_degree = int(dr.sqrt((ellipsoid.sh_coeffs.shape[0] // 3) - 1))
+        sh_dir_coef = dr.sh_eval(d, sh_degree)
+        emission = mi.Color3f(0.0)
+        for i, sh in enumerate(sh_dir_coef):
+            emission += sh * mi.Color3f(
+                [ellipsoid.sh_coeffs[i * 3 + j] for j in range(3)]
+            )
+        return dr.select(active, dr.maximum(emission + 0.5, 0.0), dr.zeros(mi.Color3f))
+
+
 
 #-------------------------------------------------------------------------------
 

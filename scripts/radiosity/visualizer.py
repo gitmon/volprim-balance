@@ -113,6 +113,8 @@ def visualize_ellipsoids(gs_scene: mi.Scene):
 
     # Begin visualization
     ps.init()
+    # V = dr.unravel(mi.Point3f, mesh.vertex_positions_buffer())
+    # ps.register_surface_mesh("GSS", V.numpy().T, F.numpy().T)
     points = ps.register_point_cloud("GS", pos.numpy().T)
 
     # Gather per-ellipsoid data by picking one triangle for each ellipsoid

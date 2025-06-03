@@ -7,4 +7,7 @@ from . import common
 
 from . import volprim_prb
 from . import volprim_rf
+from . import volprim_pdf
+from . import volprim_rf_pdf
+from . import volprim_alpha
 from . import volprim_tomography

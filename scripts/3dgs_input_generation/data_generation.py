@@ -5,7 +5,7 @@ sys.path.insert(0, '/home/jonathan/Documents/mi3-gs/build/python')
 import numpy as np
 
 import drjit as dr
-from drjit.auto.ad import Float, UInt
+from drjit.auto.ad import Float, UInt, Bool
 import mitsuba as mi
 from plyfile import PlyData, PlyElement
 
@@ -13,13 +13,18 @@ HOME_DIR = "/home/jonathan/Documents/volprim-balance/3dgs_input"
 
 # ----------------- Point cloud generation ------------------
 
-def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int = 32768) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int = 1 << 12, shape_indices = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate a point cloud on the surfaces of the scene.
     """
     shapes = scene.shapes_dr()
     sampler = mi.load_dict({'type':'independent'})
     sampler.seed(0, wavefront_size = num_points)
+    if shape_indices is not None:
+        pmf = dr.zeros(Float, len(shapes))
+        dr.scatter_add(pmf, 1.0, UInt(shape_indices))
+    else:
+        pmf = dr.ones(Float, len(shapes))
     shape_distr = mi.DiscreteDistribution(dr.ones(Float, dr.width(shapes))) # replace with equi-area?
 
     sampled_idxs = shape_distr.sample(sampler.next_1d())
@@ -28,7 +33,7 @@ def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int =
 
     si = mi.SurfaceInteraction3f(surface_samples, mi.Color0f())
     si.shape = sampled_shape
-    si.wi = -si.n
+    si.wi = mi.Vector3f(0.0, 0.0, 1.0) #-si.n
 
     # Compute the points' colors. If surface is an emitter, use the emitted radiance; 
     # otherwise, use the surface BSDF's albedo.
@@ -148,7 +153,9 @@ def make_hemispherical_cameras(
         radius: float = 1.0, 
         outward: bool = False, 
         tophalf: bool = False,
-        density: int = 0) -> CameraPose:
+        density: int = 0,
+        rotation: np.ndarray = None,
+        ) -> CameraPose:
     """
     Create a set of camera poses evenly distributed on an icosphere. The "density" parameter controls the 
     icosphere's subdivision level, which in turn determines the total number of camera poses generated.
@@ -164,6 +171,10 @@ def make_hemispherical_cameras(
     origins = origins[mask]
     targets = targets[mask]
     ups = ups[mask]
+    if rotation is not None:
+        origins = (origins - center) @ rotation.T + center
+        targets = (targets - center) @ rotation.T + center
+        ups = ups @ rotation.T
     return CameraPose(origins, targets, ups)
 
 def concatenate_cameras(pose_sets: Iterable[CameraPose]):
