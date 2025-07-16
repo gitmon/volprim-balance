@@ -79,7 +79,7 @@ def gaussian_angle_pdf(
     return dr.select(active, vol_pdf, 0.0), active
 
 
-class EnergyPMFv2:
+class EnergyPMF:
     def __init__(self, scene: mi.Scene):
         ellipsoids_found = False
         for shape in scene.shapes():
@@ -157,8 +157,6 @@ class EnergyPMFv2:
         E_splats *= area_estimate
         # E_splats = dr.sqrt(E_splats)
 
-        # E_splats = dr.ones(Float, dr.width(sh_norm))
-
         # Construct the probability distribution
         pmf = mi.DiscreteDistribution(E_splats)
         self.pmf = pmf
@@ -191,7 +189,7 @@ class EnergyPMFv2:
 
         u = cube_to_std_normal(sample2, sample2_)
         sample_pos = ellipsoid.rot @ (ellipsoid.scale * u) + ellipsoid.center
-        direction  = dr.normalize(sample_pos - si.p)
+        direction  = mi.Vector3f(dr.normalize(sample_pos - si.p))
 
         _, active = gaussian_angle_pdf(ellipsoid, si.p, direction)
         return direction, active
@@ -205,7 +203,7 @@ class EnergyPMFv2:
 
         u = cube_to_unit_ball(sample2.x, sample2.y, sample1_)
         sample_pos = ellipsoid.rot @ (ellipsoid.extent * ellipsoid.scale * u) + ellipsoid.center
-        direction  = dr.normalize(sample_pos - si.p)
+        direction  = mi.Vector3f(dr.normalize(sample_pos - si.p))
 
         _, active = ball_angle_pdf(ellipsoid, si.p, direction)
         return direction, active

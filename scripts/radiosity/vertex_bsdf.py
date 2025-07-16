@@ -40,10 +40,6 @@ def bsdf_eval(
     # Ignore perfectly grazing configurations
     active &= cos_theta_i != 0.0
 
-    # if (unlikely(dr::none_or<false>(active)))
-    if dr.none(active):
-        return 0.0
-
     # Store the weights.
     mesh = si.shape
     active &= mesh.is_mesh()
@@ -105,38 +101,34 @@ def bsdf_eval(
     # Initialize the final BSDF value.
     value = dr.zeros(mi.Color3f)
     # Main specular reflection evaluation
-    # if (dr::any_or<true>(spec_reflect_active)) {
-    if dr.any(spec_reflect_active):
-        # No need to calculate luminance if there is no color tint.
-        lum = mi.luminance(base_color, si.wavelengths) if m_has_spec_tint else 1.0
-        spec_tint = eval_spec_tint(si, active) if m_has_spec_tint else 0.0
-        # Fresnel term
-        F_principled = principled_fresnel(
-            F_spec_dielectric, metallic, spec_tint, base_color, lum,
-            dr.dot(si.wi, wh), front_side, bsdf, m_eta, m_has_metallic,
-            m_has_spec_tint)
-        # Adding the specular reflection component
-        value = dr.select(spec_reflect_active, value + \
-                F_principled * D * G / (4.0 * dr.abs(cos_theta_i)), \
-                value)
+    # No need to calculate luminance if there is no color tint.
+    lum = mi.luminance(base_color, si.wavelengths) if m_has_spec_tint else 1.0
+    spec_tint = eval_spec_tint(si, active) if m_has_spec_tint else 0.0
+    # Fresnel term
+    F_principled = principled_fresnel(
+        F_spec_dielectric, metallic, spec_tint, base_color, lum,
+        dr.dot(si.wi, wh), front_side, bsdf, m_eta, m_has_metallic,
+        m_has_spec_tint)
+    # Adding the specular reflection component
+    value = dr.select(spec_reflect_active, value + \
+            F_principled * D * G / (4.0 * dr.abs(cos_theta_i)), \
+            value)
 
     # Evaluation of diffuse, retro reflection, fake subsurface and
     # sheen.
-    # if (dr::any_or<true>(diffuse_active)) {
-    if dr.any(diffuse_active):
-        Fo = schlick_weight(dr.abs(cos_theta_o))
-        Fi = schlick_weight(dr.abs(cos_theta_i))
-        # Diffuse
-        f_diff = (1.0 - 0.5 * Fi) * (1.0 - 0.5 * Fo)
-        cos_theta_d = dr.dot(wh, wo)
-        Rr          = 2.0 * roughness * dr.square(cos_theta_d)
-        # Retro reflection
-        f_retro = Rr * (Fo + Fi + Fo * Fi * (Rr - 1.0))
-        # Adding diffuse, retro evaluation. (no fake ss.)
-        value = dr.select(diffuse_active, value + \
-            brdf * dr.abs(cos_theta_o) * base_color * \
-            dr.inv_pi * (f_diff + f_retro), \
-            value)
+    Fo = schlick_weight(dr.abs(cos_theta_o))
+    Fi = schlick_weight(dr.abs(cos_theta_i))
+    # Diffuse
+    f_diff = (1.0 - 0.5 * Fi) * (1.0 - 0.5 * Fo)
+    cos_theta_d = dr.dot(wh, wo)
+    Rr          = 2.0 * roughness * dr.square(cos_theta_d)
+    # Retro reflection
+    f_retro = Rr * (Fo + Fi + Fo * Fi * (Rr - 1.0))
+    # Adding diffuse, retro evaluation. (no fake ss.)
+    value = dr.select(diffuse_active, value + \
+        brdf * dr.abs(cos_theta_o) * base_color * \
+        dr.inv_pi * (f_diff + f_retro), \
+        value)
     return value & active
 
 def bsdf_pdf(
@@ -155,10 +147,6 @@ def bsdf_pdf(
     cos_theta_i = mi.Frame3f.cos_theta(si.wi)
     # Ignore perfectly grazing configurations.
     active &= cos_theta_i != 0.0
-
-    # if (unlikely(dr::none_or<false>(active)))
-    if dr.none(active):
-        return 0.0
 
     # Store the weights.
     mesh = si.shape
@@ -254,10 +242,6 @@ def bsdf_sample(
     # Ignoring perfectly grazing incoming rays
     active &= cos_theta_i != 0.0
 
-    # if unlikely(dr::none_or<false>(active)):
-    if dr.none(active):
-        return (bs, dr.zeros(mi.Color3f))
-
     # Store the weights.
     mesh = si.shape
     active &= mesh.is_mesh()
@@ -310,36 +294,32 @@ def bsdf_sample(
     bs.eta = 1.0
 
     # Main specular reflection sampling
-    # if dr::any_or<true>(sample_spec_reflect)) {
-    if dr.any(sample_spec_reflect):
-        wo = mi.reflect(si.wi, m_spec)
-        # dr.masked(bs.wo, sample_spec_reflect) = wo
-        # dr.masked(bs.sampled_component, sample_spec_reflect) = 3
-        # dr.masked(bs.sampled_type, sample_spec_reflect) = +mi.BSDFFlags.GlossyReflection
-        bs.wo = dr.select(sample_spec_reflect, wo, bs.wo)
-        bs.sampled_component = dr.select(sample_spec_reflect, 3, bs.sampled_component)
-        bs.sampled_type = dr.select(sample_spec_reflect, +mi.BSDFFlags.GlossyReflection, bs.sampled_type)
+    wo = mi.reflect(si.wi, m_spec)
+    # dr.masked(bs.wo, sample_spec_reflect) = wo
+    # dr.masked(bs.sampled_component, sample_spec_reflect) = 3
+    # dr.masked(bs.sampled_type, sample_spec_reflect) = +mi.BSDFFlags.GlossyReflection
+    bs.wo = dr.select(sample_spec_reflect, wo, bs.wo)
+    bs.sampled_component = dr.select(sample_spec_reflect, 3, bs.sampled_component)
+    bs.sampled_type = dr.select(sample_spec_reflect, +mi.BSDFFlags.GlossyReflection, bs.sampled_type)
 
-        # Filter the cases where macro and micro surfaces do not agree
-        # on the same side and reflection is not successful
-        reflect = cos_theta_i * mi.Frame3f.cos_theta(wo) > 0.0
-        active &= (~sample_spec_reflect |
-            (mac_mic_compatibility(mi.Vector3f(m_spec),
-                                    si.wi, wo, cos_theta_i, True) &
-            reflect))
+    # Filter the cases where macro and micro surfaces do not agree
+    # on the same side and reflection is not successful
+    reflect = cos_theta_i * mi.Frame3f.cos_theta(wo) > 0.0
+    active &= (~sample_spec_reflect |
+        (mac_mic_compatibility(mi.Vector3f(m_spec),
+                                si.wi, wo, cos_theta_i, True) &
+        reflect))
 
     # Cosine hemisphere reflection sampling
-    # if (dr::any_or<true>(sample_diffuse)) {
-    if dr.any(sample_diffuse):
-        wo = mi.warp.square_to_cosine_hemisphere(sample2)
-        # dr.masked(bs.wo, sample_diffuse)                = wo
-        # dr.masked(bs.sampled_component, sample_diffuse) = 0
-        # dr.masked(bs.sampled_type, sample_diffuse) = mi.BSDFFlags.DiffuseReflection
-        bs.wo = dr.select(sample_diffuse, wo, bs.wo)
-        bs.sampled_component = dr.select(sample_diffuse, 0, bs.sampled_component)
-        bs.sampled_type = dr.select(sample_diffuse, +mi.BSDFFlags.DiffuseReflection, bs.sampled_type)
-        reflect = cos_theta_i * mi.Frame3f.cos_theta(wo) > 0.0
-        active &= ~sample_diffuse | reflect
+    wo = mi.warp.square_to_cosine_hemisphere(sample2)
+    # dr.masked(bs.wo, sample_diffuse)                = wo
+    # dr.masked(bs.sampled_component, sample_diffuse) = 0
+    # dr.masked(bs.sampled_type, sample_diffuse) = mi.BSDFFlags.DiffuseReflection
+    bs.wo = dr.select(sample_diffuse, wo, bs.wo)
+    bs.sampled_component = dr.select(sample_diffuse, 0, bs.sampled_component)
+    bs.sampled_type = dr.select(sample_diffuse, +mi.BSDFFlags.DiffuseReflection, bs.sampled_type)
+    reflect = cos_theta_i * mi.Frame3f.cos_theta(wo) > 0.0
+    active &= ~sample_diffuse | reflect
 
     bs.pdf = bsdf_pdf(si, bs.wo, active, m_specular, m_has_anisotropic, m_has_metallic, m_spec_srate, m_diff_refl_srate)
     active &= bs.pdf > 0.0
@@ -472,8 +452,6 @@ class Diffuse(VertexBSDF):
         bs = dr.zeros(mi.BSDFSample3f)
 
         active &= cos_theta_i > 0.0
-        if dr.none(active):
-            return bs, 0.0
 
         bs.wo  = mi.warp.square_to_cosine_hemisphere(sample2)
         bs.pdf = mi.warp.square_to_cosine_hemisphere_pdf(bs.wo)

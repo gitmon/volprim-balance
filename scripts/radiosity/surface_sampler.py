@@ -65,3 +65,50 @@ class SceneSurfaceSampler:
         #     return si, *point_light.sample_direction(si, uv, True), rng_state
         # else:
         #     return si, dr.zeros(mi.DirectionSample3f), dr.zeros(mi.Color3f), rng_state
+
+    def sample_stratified(self, sampler: mi.Sampler, num_points_target: int = None, fraction: float = 1.0, rng_state: int = 0) -> tuple[mi.SurfaceInteraction3f, int]:
+        sampler.seed(rng_state, 1); rng_state += 0x00FF_FFFF
+        idx = self.distribution.sample(sampler.next_1d(), True)
+
+        mesh = dr.gather(mi.ShapePtr, self.shape_ptrs, idx)[0]
+        if not(mesh.is_mesh()):
+            raise AssertionError("Shape to sample from is not a triangle mesh!")
+
+        F = dr.unravel(mi.Point3u, mesh.faces_buffer())
+        sampler.seed(rng_state, mesh.face_count()); rng_state += 0x00FF_FFFF
+        bary = mi.warp.square_to_uniform_triangle(sampler.next_2d())
+
+        p0 = mesh.vertex_position(F.x)
+        p1 = mesh.vertex_position(F.y)
+        p2 = mesh.vertex_position(F.z)
+        e0 = p1 - p0
+        e1 = p2 - p0
+        sample_pos = dr.fma(e0, bary.x, dr.fma(e1, bary.y, p0))
+        if mesh.has_vertex_normals():
+            n0 = mesh.vertex_normal(F.x)
+            n1 = mesh.vertex_normal(F.y)
+            n2 = mesh.vertex_normal(F.z)
+            sample_n = dr.fma(n0, 1.0 - bary.x - bary.y, 
+                              dr.fma(n1, bary.x, n2 * bary.y))
+        else:
+            sample_n = dr.cross(e0, e1)
+        si = dr.zeros(mi.SurfaceInteraction3f)
+        si.p = sample_pos
+        si.n = dr.normalize(sample_n)
+        si.sh_frame = mi.Frame3f(si.n)
+        si.prim_index = dr.arange(mi.UInt, mesh.face_count())
+        si.shape = dr.gather(mi.ShapePtr, self.shape_ptrs, dr.repeat(mi.UInt(idx[0]), mesh.face_count()))
+
+        uv = sampler.next_2d()
+        wo_local = mi.warp.square_to_cosine_hemisphere(uv)
+        si.wi = wo_local
+
+        if num_points_target is not None:
+            fraction = min(1.0, num_points_target / mesh.face_count())
+
+        if fraction < 1.0:
+            retained_indices = dr.compress(sampler.next_1d() < fraction)
+            si = dr.gather(mi.SurfaceInteraction3f, si, retained_indices)
+
+        num_points = dr.width(si)
+        return si, num_points, rng_state

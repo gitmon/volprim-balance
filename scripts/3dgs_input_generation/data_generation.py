@@ -13,7 +13,7 @@ HOME_DIR = "/home/jonathan/Documents/volprim-balance/3dgs_input"
 
 # ----------------- Point cloud generation ------------------
 
-def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int = 1 << 12, shape_indices = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int = 1 << 18, shape_indices = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate a point cloud on the surfaces of the scene.
     """
@@ -62,6 +62,8 @@ def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int =
         positions_sph = 3.0 * max_extent * directions
         normals_sph   = -directions
         colors_sph    = envmap.eval(si_tmp)
+        if dr.width(colors_sph) == 1:
+            colors_sph = dr.repeat(colors_sph, num_points_env)
 
         # Contribution 2: importance-sampled points
         it_scene = mi.Interaction3f(0.0, 0.0, mi.Color0f(), p=scene.bbox().center(), n=mi.Vector3f(0,0,1))
@@ -69,6 +71,8 @@ def generate_point_cloud(scene: mi.Scene, num_points: int, num_points_env: int =
         positions_imp = 3.0 * max_extent * ds.d
         colors_imp    = weight * ds.pdf
         normals_imp   = ds.n
+        if dr.width(colors_imp) == 1:
+            colors_imp = dr.repeat(colors_imp, num_points_env)
 
         # Assemble points' data
         positions_sph = positions_sph.numpy().T
@@ -171,6 +175,31 @@ def make_hemispherical_cameras(
     origins = origins[mask]
     targets = targets[mask]
     ups = ups[mask]
+    if rotation is not None:
+        origins = (origins - center) @ rotation.T + center
+        targets = (targets - center) @ rotation.T + center
+        ups = ups @ rotation.T
+    return CameraPose(origins, targets, ups)
+
+def make_circular_cameras(
+        center: np.ndarray = np.zeros(3), 
+        radius: float = 1.0, 
+        outward: bool = False, 
+        density: int = 0,
+        rotation: np.ndarray = None,
+        ) -> CameraPose:
+    """
+    Create a set of camera poses evenly distributed on an icosphere. The "density" parameter controls the 
+    icosphere's subdivision level, which in turn determines the total number of camera poses generated.
+    """
+    thetas = np.linspace(0, np.pi * 2.0, density * 60)
+    V = np.c_[np.cos(thetas), np.zeros_like(thetas), np.sin(thetas)]
+    V = radius * V + center[None, :]
+    N = V - center[None,:]
+    origins = V
+    targets = origins + (N if outward else -N)
+    ups = np.zeros_like(origins); ups[:,1] = 1.0
+
     if rotation is not None:
         origins = (origins - center) @ rotation.T + center
         targets = (targets - center) @ rotation.T + center
